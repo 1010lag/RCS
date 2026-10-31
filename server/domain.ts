@@ -1,0 +1,212 @@
+import { randomUUID } from "node:crypto";
+import type { Sql } from "./db";
+import type { User, PayType } from "../shared/types";
+export class Problem extends Error {
+  constructor(
+    public status: number,
+    public code: string,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+export const fail = (code: string, message: string, status = 422): never => {
+  throw new Problem(status, code, message);
+};
+export const uid = randomUUID;
+export const money = (value: unknown): string => {
+  const s = String(value);
+  if (!/^\d{1,9}(\.\d{1,2})?$/.test(s))
+    fail(
+      "INVALID_MONEY",
+      "Укажите неотрицательную сумму с точностью до копейки",
+    );
+  return Number(s).toFixed(2);
+};
+export function phone(value: string): string {
+  const p = value.replace(/[\s()\-]/g, "");
+  if (!/^\+\d{10,15}$/.test(p))
+    fail(
+      "INVALID_PHONE",
+      "Введите телефон в международном формате, например +375291234567",
+    );
+  return p;
+}
+export function dateTime(date: string, time: string): string {
+  if (
+    !/^\d{4}-\d{2}-\d{2}$/.test(date) ||
+    !/^([01]\d|2[0-3]):[0-5]\d$/.test(time)
+  )
+    fail("INVALID_DATE", "Проверьте дату и время");
+  const d = new Date(`${date}T${time}:00+03:00`);
+  if (
+    !Number.isFinite(d.getTime()) ||
+    new Date(d.getTime() + 10800000).toISOString().slice(0, 10) !== date
+  )
+    fail("INVALID_DATE", "Такой даты не существует");
+  return d.toISOString();
+}
+export function period(from: string, to: string) {
+  dateTime(from, "00:00");
+  dateTime(to, "00:00");
+  const days = (Date.parse(to) - Date.parse(from)) / 86400000;
+  if (days < 0 || days > 93)
+    fail("INVALID_PERIOD", "Выберите период не более 93 дней");
+  return [from, to];
+}
+export function localDate(now = new Date()): string {
+  return new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "Europe/Minsk",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(now);
+}
+export function amount(
+  minutes: number,
+  rate: string,
+  payType: PayType,
+): string {
+  const [whole, fraction = ""] = rate.split(".");
+  const cents = BigInt(whole) * 100n + BigInt(fraction.padEnd(2, "0"));
+  const total =
+    payType === "shift" ? cents : (BigInt(minutes) * cents + 30n) / 60n;
+  return `${total / 100n}.${String(total % 100n).padStart(2, "0")}`;
+}
+export const publicUser = (u: any): User => ({
+  id: u.id,
+  name: u.name,
+  phone: u.phone,
+  role: u.role,
+  active: u.active,
+  rate: u.rate,
+  pay_type: u.pay_type,
+  version: u.version,
+  must_change_password: u.must_change_password,
+  avatar_url: u.avatar_url ?? null,
+});
+export async function now(sql: Sql): Promise<Date> {
+  return new Date((await sql.query("SELECT clock_timestamp() AS now"))[0].now);
+}
+export async function audit(
+  sql: Sql,
+  actor: string | null,
+  action: string,
+  entity: string,
+  id: string | null,
+  before: unknown = null,
+  after: unknown = null,
+  reason?: string,
+) {
+  await sql.query(
+    "INSERT INTO audit_logs(id,actor_id,action,entity,entity_id,before_value,after_value,reason) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+    [
+      uid(),
+      actor,
+      action,
+      entity,
+      id,
+      JSON.stringify(before),
+      JSON.stringify(after),
+      reason ?? null,
+    ],
+  );
+  await sql.query("INSERT INTO events DEFAULT VALUES");
+}
+export async function notify(
+  sql: Sql,
+  users: (string | null)[],
+  title: string,
+  body: string,
+  category = "schedule",
+  link = "schedule",
+  dedup?: string,
+) {
+  for (const user of new Set(users.filter(Boolean))) {
+    const id = uid();
+    const result = await sql.query(
+      "INSERT INTO notifications(id,user_id,title,body,category,link,dedup_key) SELECT $1,id,$3,$4,$5,$6,$7 FROM users WHERE id=$2 AND active ON CONFLICT(dedup_key) DO NOTHING RETURNING id",
+      [
+        id,
+        user,
+        title,
+        body,
+        category,
+        link,
+        dedup ? `${dedup}:${user}` : null,
+      ],
+    );
+    if (result.length) {
+      await sql.query("INSERT INTO events DEFAULT VALUES");
+      await sql.query(
+        "INSERT INTO deliveries(id,notification_id,device_id) SELECT gen_random_uuid(),$1,d.id FROM push_devices d LEFT JOIN preferences p ON p.user_id=d.user_id WHERE d.user_id=$2 AND COALESCE((to_jsonb(p)->>$3)::boolean,true) ON CONFLICT DO NOTHING",
+        [id, user, category],
+      );
+    }
+  }
+}
+export async function admins(sql: Sql): Promise<string[]> {
+  return (
+    await sql.query("SELECT id FROM users WHERE role='admin' AND active")
+  ).map((u) => u.id);
+}
+export async function shiftForUpdate(sql: Sql, id: string) {
+  const s = (
+    await sql.query(
+      "SELECT *, date::text AS date FROM shifts WHERE id=$1 FOR UPDATE",
+      [id],
+    )
+  )[0];
+  if (!s) fail("NOT_FOUND", "Смена не найдена", 404);
+  return s;
+}
+export function expectVersion(row: any, version: number) {
+  if (row.version !== version)
+    fail(
+      "STALE_VERSION",
+      "Данные изменились. Обновите страницу и повторите действие",
+      409,
+    );
+}
+export async function assertExchange(sql: Sql, shift: any, time?: Date) {
+  const t = time ?? (await now(sql));
+  if (t >= new Date(shift.start_at))
+    fail("SHIFT_STARTED", "Смена уже началась", 409);
+  if (t >= new Date(`${shift.date}T19:00:00+03:00`))
+    fail(
+      "EXCHANGE_DEADLINE_PASSED",
+      "Биржа закрыта: наступило 19:00 по Минску",
+      409,
+    );
+  const type = (
+    await sql.query("SELECT * FROM shift_types WHERE id=$1 FOR SHARE", [
+      shift.type_id,
+    ])
+  )[0];
+  if (
+    shift.exchanged ||
+    shift.exchange_locked ||
+    !type.active ||
+    !type.allow_exchange ||
+    ["cancelled", "worked", "closed"].includes(shift.status)
+  )
+    fail("EXCHANGE_FORBIDDEN", "Эту смену нельзя передать через биржу", 409);
+  return type;
+}
+export async function closeListing(sql: Sql, shiftId: string) {
+  await sql.query(
+    "UPDATE exchange_listings SET status='cancelled' WHERE shift_id=$1 AND status='open'",
+    [shiftId],
+  );
+}
+export function rateFor(type: any, user: any, override?: string | null) {
+  return override != null
+    ? money(override)
+    : user?.rate != null && user.pay_type === type.pay_type
+      ? user.rate
+      : type.rate;
+}
+export const shiftProjection = `s.id, s.date::text, to_char(s.start_at AT TIME ZONE 'Europe/Minsk','HH24:MI') AS start_time, to_char(s.end_at AT TIME ZONE 'Europe/Minsk','HH24:MI') AS end_time, s.start_at, s.end_at, s.type_id, t.name AS type_name, s.user_id, u.name AS user_name, u.avatar_url AS user_avatar_url, s.status, s.version, s.exchanged, s.exchange_locked, (t.allow_exchange AND t.active) AS exchange_allowed, l.id AS exchange_id, LEAST(s.start_at, (s.date + time '19:00') AT TIME ZONE 'Europe/Minsk') AS closes_at`;
+export const shiftJoins = `FROM shifts s JOIN shift_types t ON t.id=s.type_id LEFT JOIN users u ON u.id=s.user_id LEFT JOIN exchange_listings l ON l.shift_id=s.id AND l.status='open' AND l.closes_at>clock_timestamp()`;
+export const financeProjection = `, (EXTRACT(EPOCH FROM (s.end_at-s.start_at))/60)::integer AS minutes, s.rate::text, s.pay_type, s.comment, COALESCE(a.minutes,0)::integer AS adjustment_minutes, COALESCE(a.amount,0)::text AS adjustment_amount, (CASE WHEN s.pay_type='shift' THEN s.rate ELSE round(((EXTRACT(EPOCH FROM(s.end_at-s.start_at))/60)+COALESCE(a.minutes,0))*s.rate/60,2) END + COALESCE(a.amount,0))::text AS amount`;
+export const adjustmentJoin = `LEFT JOIN (SELECT shift_id,sum(minutes) AS minutes,sum(amount) AS amount FROM adjustments GROUP BY shift_id) a ON a.shift_id=s.id`;

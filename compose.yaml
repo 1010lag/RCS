@@ -1,0 +1,26 @@
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: rcs
+      POSTGRES_USER: rcs
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U rcs -d rcs]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  app:
+    build: .
+    environment:
+      DATABASE_URL: postgres://rcs:${POSTGRES_PASSWORD}@db:5432/rcs
+      APP_ORIGIN: ${APP_ORIGIN:?Set HTTPS APP_ORIGIN}
+    ports:
+      - 127.0.0.1:3001:3001
+    depends_on:
+      db:
+        condition: service_healthy
+volumes:
+  postgres_data:
