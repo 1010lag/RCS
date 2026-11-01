@@ -11,7 +11,7 @@ import { payrollRows } from "./payroll";
 import { notificationText } from "./notification-text";
 import type { Database, Sql } from "./db";
 import type { User } from "../shared/types";
-import { canTakeExchangeAt } from "../shared/exchange-window";
+import { canTakeExchangeAt, exchangeDeadline } from "../shared/exchange-window";
 import { firebasePush, invalidPushToken, platformPushReady, type PushGateway } from "./push";
 import {
   Problem,
@@ -32,6 +32,8 @@ import {
   assertUnadjusted,
   closeListing,
   rateFor,
+  payTypeFor,
+  positiveRate,
   shiftProjection,
   shiftJoins,
   financeProjection,
@@ -47,22 +49,29 @@ declare module "fastify" {
 }
 const digest = (s: string) => createHash("sha256").update(s).digest("hex");
 const idSchema = z.string().uuid();
-const text = z.string().trim().min(1).max(200);
+z.config(z.locales.ru());
+const text = z.string().trim().min(1, "Заполните поле").max(200);
+const passwordSchema = z.string().min(10, "Пароль должен содержать минимум 10 символов").max(128)
+  .refine((value) => value.trim().length >= 10, "Пароль должен содержать минимум 10 символов без пробелов по краям");
 const reasonSchema = z.object({
   reason: z.string().trim().min(3, "Укажите причину (от 3 символов)").max(1000),
 });
 const paramsId = (req: FastifyRequest) =>
   idSchema.parse((req.params as any).id);
+function assertOpenListing(listing: any, at: Date) {
+  if (!listing) fail("NOT_FOUND", "Объявление не найдено", 404);
+  if (listing.status === "taken") fail("EXCHANGE_ALREADY_TAKEN", "Эту смену уже забрали", 409);
+  if (listing.status === "cancelled") fail("LISTING_WITHDRAWN", "Владелец отозвал объявление", 409);
+  if (listing.status !== "open") fail("LISTING_CLOSED", listing.status === "expired" ? "Срок объявления истёк" : "Объявление закрыто", 409);
+  if (at >= new Date(listing.closes_at)) fail("LISTING_CLOSED", "Срок объявления истёк", 409);
+}
 const userSchema = z.object({
   name: text,
   phone: z.string(),
   role: z.enum(["admin", "barista"]).default("barista"),
   rate: z.string().nullable().default(null),
   pay_type: z.enum(["hourly", "shift"]).default("hourly"),
-  password: z
-    .string()
-    .min(10, "Пароль должен содержать минимум 10 символов")
-    .max(128),
+  password: passwordSchema,
   current_password: z.string().max(128).optional(),
 });
 const typeSchema = z.object({
@@ -155,8 +164,8 @@ export async function createApp(
       });
     if (e.code === "23505")
       return reply.code(409).send({
-        code: "ALREADY_EXISTS",
-        message: "Такая запись уже существует",
+        code: e.constraint === "users_phone_key" ? "PHONE_TAKEN" : "ALREADY_EXISTS",
+        message: e.constraint === "users_phone_key" ? "Этот телефон уже занят" : "Такая запись уже существует",
       });
     if (
       e.code === "23514" ||
@@ -285,7 +294,7 @@ export async function createApp(
       )[0];
       // Hash once for a missing user as well, so login timing does not identify accounts.
       const valid = await cpu.run(() => verify(u?.password_hash ?? dummyPasswordHash, body.password));
-      if (!u || !valid)
+      if (!u || !valid || !body.password.trim())
         fail("LOGIN_FAILED", "Неверный телефон или пароль", 401);
       await db.query("DELETE FROM request_limits WHERE key=$1", [accountKey]);
       const token = randomBytes(32).toString("hex"),
@@ -328,7 +337,7 @@ export async function createApp(
   });
   route("POST", "/auth/password", async (req, reply) => {
     const b = z
-      .object({ current: z.string(), password: z.string().min(10).max(128) })
+      .object({ current: z.string(), password: passwordSchema })
       .parse(req.body);
     await consumeBudget(db, budgetKey("password", req.user.id), 5, 15 * 60000);
     const u = (
@@ -338,6 +347,8 @@ export async function createApp(
     )[0];
     if (!(await cpu.run(() => verify(u.password_hash, b.current))))
       fail("LOGIN_FAILED", "Текущий пароль неверен", 403);
+    if (await cpu.run(() => verify(u.password_hash, b.password)))
+      fail("SAME_PASSWORD", "Новый пароль должен отличаться от текущего");
     const hashed = await cpu.run(() => hash(b.password));
     const session = await db.tx(async (sql) => {
       await sql.query(
@@ -403,7 +414,7 @@ export async function createApp(
       const clean = {
         ...b,
         phone: phone(b.phone),
-        rate: b.rate === null ? null : money(b.rate),
+        rate: b.rate === null ? null : positiveRate(b.rate),
       };
       return db.tx(async (sql) => {
         if (b.role === "admin") await reauthenticate(sql, req, b.current_password);
@@ -449,8 +460,9 @@ export async function createApp(
             pay_type: z.enum(["hourly", "shift"]),
             active: z.boolean(),
             version: z.number().int(),
+            apply_to_future: z.boolean().default(false),
             reason: z.string().trim().min(3),
-            password: z.string().min(10, "Пароль должен содержать минимум 10 символов").max(128).optional(),
+            password: passwordSchema.optional(),
             current_password: z.string().max(128).optional(),
           })
           .parse(req.body);
@@ -476,6 +488,8 @@ export async function createApp(
           else await sql.query("DELETE FROM sessions WHERE user_id=$1", [id]);
           await sql.query("DELETE FROM push_devices WHERE user_id=$1", [id]);
         }
+        if (b.password && await cpu.run(() => verify(old.password_hash, b.password!)))
+          fail("SAME_PASSWORD", "Новый пароль должен отличаться от текущего");
         const newPasswordHash = b.password ? await cpu.run(() => hash(b.password!)) : null;
         if (newPasswordHash) {
           if (!b.active) fail("INACTIVE_USER", "Для смены пароля сначала восстановите сотрудника");
@@ -506,7 +520,8 @@ export async function createApp(
             if (future) await audit(sql, req.user.id, "Смена отменена при удалении сотрудника", "shift", shift.id,
               { status: shift.status, user_id: id }, { status: "cancelled", user_id: id }, b.reason);
           }
-          await sql.query("UPDATE exchange_listings SET status='cancelled' WHERE listed_by=$1 AND status='open'", [id]);
+          const remaining = await sql.query("SELECT shift_id FROM exchange_listings WHERE listed_by=$1 AND status='open'", [id]);
+          for (const listing of remaining) await closeListing(sql, listing.shift_id);
           await sql.query("DELETE FROM sessions WHERE user_id=$1", [id]);
           await sql.query("DELETE FROM push_devices WHERE user_id=$1", [id]);
         }
@@ -516,13 +531,18 @@ export async function createApp(
             [
               b.name,
               phone(b.phone),
-              b.rate === null ? null : money(b.rate),
+              b.rate === null ? null : positiveRate(b.rate),
               b.pay_type,
               b.active,
               id,
             ],
           )
         )[0];
+        if (String(old.rate) !== String(u.rate) || old.pay_type !== u.pay_type) {
+          if (b.apply_to_future && u.rate !== null) await updateFutureRates(sql, req.user.id, id, u.rate, u.pay_type, b.reason);
+          await notify(sql, [id].filter((recipient) => recipient !== req.user.id), "Ваша ставка изменена",
+            b.apply_to_future ? "Новая ставка применяется к новым сменам. Будущие смены по ставке сотрудника пересчитаны; ручные ставки сохранены." : "Новая ставка будет применяться к новым сменам. Существующие назначения сохраняют прежнюю оплату.", "adjustments", "payroll");
+        }
         await audit(
           sql,
           req.user.id,
@@ -540,6 +560,15 @@ export async function createApp(
     },
     true,
   );
+  async function updateFutureRates(sql: Sql, actor: string, userId: string, rate: string, payType: string, reason: string) {
+    const shifts = await sql.query("SELECT s.id,s.rate::text,s.pay_type FROM shifts s JOIN shift_types t ON t.id=s.type_id WHERE s.user_id=$1 AND s.start_at>$2 AND s.status IN ('planned','confirmed') AND t.pay_type='hourly' AND NOT s.rate_override FOR UPDATE OF s", [userId, await time(sql)]);
+    for (const shift of shifts) {
+      await sql.query("UPDATE shifts SET rate=$1,pay_type=$2,version=version+1,updated_at=clock_timestamp() WHERE id=$3", [rate, payType, shift.id]);
+      await closeListing(sql, shift.id);
+      await audit(sql, actor, "Ставка будущей смены обновлена", "shift", shift.id, { rate: shift.rate, pay_type: shift.pay_type }, { rate, pay_type: payType }, reason);
+    }
+    return shifts.length;
+  }
   route(
     "PATCH",
     "/employees/:id/hourly-rate",
@@ -554,7 +583,7 @@ export async function createApp(
             reason: z.string().trim().min(3).max(1000),
           })
           .parse(req.body);
-        const rate = money(body.rate);
+        const rate = positiveRate(body.rate);
         const old = (
           await sql.query("SELECT * FROM users WHERE id=$1 FOR UPDATE", [id])
         )[0];
@@ -564,31 +593,7 @@ export async function createApp(
           "UPDATE users SET rate=$1,pay_type='hourly',version=version+1 WHERE id=$2",
           [rate, id],
         );
-        let changed = 0;
-        if (body.apply_to_future) {
-          const shifts = await sql.query(
-            "SELECT id,rate::text FROM shifts WHERE user_id=$1 AND start_at>$2 AND status IN ('planned','confirmed') AND pay_type='hourly' AND NOT rate_override FOR UPDATE",
-            [id, await time(sql)],
-          );
-          for (const s of shifts) {
-            await sql.query(
-              "UPDATE shifts SET rate=$1,version=version+1,updated_at=clock_timestamp() WHERE id=$2",
-              [rate, s.id],
-            );
-            await closeListing(sql, s.id);
-            await audit(
-              sql,
-              req.user.id,
-              "Почасовая ставка смены обновлена",
-              "shift",
-              s.id,
-              { rate: s.rate },
-              { rate },
-              body.reason,
-            );
-          }
-          changed = shifts.length;
-        }
+        const changed = body.apply_to_future ? await updateFutureRates(sql, req.user.id, id, rate, "hourly", body.reason) : 0;
         await audit(
           sql,
           req.user.id,
@@ -601,10 +606,10 @@ export async function createApp(
         );
         await notify(
           sql,
-          [id],
+          [id].filter((recipient) => recipient !== req.user.id),
           "Ваша почасовая ставка изменена",
-          changed
-            ? "Обновлена ставка и расчёт будущих почасовых смен. Подробности — в ваших начислениях."
+          body.apply_to_future
+            ? `Обновлена ставка и расчёт будущих смен по ставке сотрудника (${changed}). Подробности — в ваших начислениях.`
             : "Новая ставка будет применяться при создании новых почасовых смен.",
           "adjustments",
           "payroll",
@@ -625,7 +630,8 @@ export async function createApp(
       id = update ? paramsId(req) : uid();
     dateTime("2026-01-01", b.start_time);
     dateTime("2026-01-01", b.end_time);
-    if (b.start_time >= b.end_time)
+    if (b.start_time === b.end_time) fail("ZERO_DURATION", "Начало и окончание не могут совпадать");
+    if (b.start_time > b.end_time)
       fail("OVERNIGHT", "Начало и окончание должны быть в одном дне");
     return db.tx(async (sql) => {
       let old = null;
@@ -657,11 +663,10 @@ export async function createApp(
           : "INSERT INTO shift_types(name,start_time,end_time,pay_type,rate,allow_exchange,active,id) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
         args,
       );
-      if (!b.allow_exchange || !b.active)
-        await sql.query(
-          "UPDATE exchange_listings SET status='cancelled' WHERE status='open' AND shift_id IN (SELECT id FROM shifts WHERE type_id=$1)",
-          [id],
-        );
+      if (!b.allow_exchange || !b.active) {
+        const listings = await sql.query("SELECT l.shift_id FROM exchange_listings l JOIN shifts s ON s.id=l.shift_id WHERE l.status='open' AND s.type_id=$1", [id]);
+        for (const listing of listings) await closeListing(sql, listing.shift_id);
+      }
       await audit(
         sql,
         req.user.id,
@@ -679,8 +684,8 @@ export async function createApp(
   route("GET", "/schedule", async (req) => {
     const [from, to] = range(req);
     return db.query(
-      `SELECT ${shiftProjection} ${req.user.role === "admin" ? financeProjection : ""} ${shiftJoins} ${req.user.role === "admin" ? adjustmentJoin : ""} WHERE s.date BETWEEN $1 AND $2 AND (s.user_id IS NULL OR u.active OR s.end_at<=$3) ORDER BY s.start_at,u.name`,
-      [from, to, await time(db)],
+      `SELECT ${shiftProjection} ${req.user.role === "admin" ? financeProjection : ""} ${shiftJoins} ${req.user.role === "admin" ? adjustmentJoin : ""} WHERE s.date BETWEEN $1 AND $2 ORDER BY s.start_at,u.name`,
+      [from, to],
     );
   });
   route("GET", "/me/shifts", async (req) => {
@@ -746,7 +751,7 @@ export async function createApp(
         old.user_id !== b.user_id &&
         (
           await sql.query(
-            "SELECT id FROM adjustments WHERE shift_id=$1 LIMIT 1",
+            "SELECT id FROM adjustments WHERE shift_id=$1 AND (minutes<>0 OR amount<>0) LIMIT 1",
             [id],
           )
         ).length
@@ -768,11 +773,11 @@ export async function createApp(
       b.rate_override == null;
     const rate =
       b.rate_override != null
-        ? money(b.rate_override)
+        ? (type.pay_type === "hourly" ? positiveRate(b.rate_override) : money(b.rate_override))
         : preserve
           ? old.rate
           : rateFor(type, u);
-    const payType = preserve ? old.pay_type : type.pay_type;
+    const payType = preserve ? old.pay_type : b.rate_override != null ? type.pay_type : payTypeFor(type, u);
     const args = [
       b.date,
       start,
@@ -800,7 +805,7 @@ export async function createApp(
       "shift",
       id,
       old ? { date: old.date, user_id: old.user_id, status: old.status } : null,
-      { date: b.date, user_id: b.user_id, status: b.status },
+      { date: b.date, start_time: b.start_time, end_time: b.end_time, type_name: type.name, user_id: b.user_id, user_name: u?.name ?? "Не назначена", status: b.status },
       b.reason,
     );
     if (old?.user_id && old.user_id !== b.user_id) await notify(sql, [old.user_id].filter((user) => user !== actor),
@@ -917,7 +922,7 @@ export async function createApp(
     const q = req.query as any;
     const history = q.history === "true";
     return db.query(
-      `SELECT l.id,l.shift_id,l.status,l.taken_by,tu.name AS taken_name,l.closes_at,s.date::text,to_char(s.start_at AT TIME ZONE 'Europe/Minsk','HH24:MI') AS start_time,to_char(s.end_at AT TIME ZONE 'Europe/Minsk','HH24:MI') AS end_time,t.name AS type_name,l.listed_by AS user_id,u.name AS user_name,s.version FROM exchange_listings l JOIN shifts s ON s.id=l.shift_id JOIN users u ON u.id=l.listed_by JOIN shift_types t ON t.id=s.type_id LEFT JOIN users tu ON tu.id=l.taken_by WHERE ${history ? (req.user.role === "admin" ? "true" : "(l.listed_by=$1 OR l.taken_by=$1)") : "l.status='open' AND l.closes_at>clock_timestamp() AND s.status NOT IN ('cancelled','closed','worked') AND NOT s.exchange_locked AND t.allow_exchange AND t.active AND NOT EXISTS (SELECT 1 FROM adjustments ax WHERE ax.shift_id=s.id)"} ORDER BY s.start_at DESC LIMIT 200`,
+      `SELECT l.id,l.shift_id,l.status,l.taken_by,tu.name AS taken_name,l.closes_at,s.date::text,to_char(s.start_at AT TIME ZONE 'Europe/Minsk','HH24:MI') AS start_time,to_char(s.end_at AT TIME ZONE 'Europe/Minsk','HH24:MI') AS end_time,t.name AS type_name,l.listed_by AS user_id,u.name AS user_name,s.version FROM exchange_listings l JOIN shifts s ON s.id=l.shift_id JOIN users u ON u.id=l.listed_by JOIN shift_types t ON t.id=s.type_id LEFT JOIN users tu ON tu.id=l.taken_by WHERE ${history ? (req.user.role === "admin" ? "true" : "(l.listed_by=$1 OR l.taken_by=$1)") : "l.status='open' AND l.closes_at>clock_timestamp() AND s.status NOT IN ('cancelled','closed','worked') AND NOT s.exchange_locked AND t.allow_exchange AND t.active AND NOT EXISTS (SELECT 1 FROM adjustments ax WHERE ax.shift_id=s.id AND (ax.minutes<>0 OR ax.amount<>0))"} ORDER BY s.start_at DESC LIMIT 200`,
       history && req.user.role !== "admin" ? [req.user.id] : [],
     );
   });
@@ -933,8 +938,8 @@ export async function createApp(
         fail("LISTING_COOLDOWN", "Повторная публикация доступна через минуту", 429);
       const id = uid();
       await sql.query(
-        "INSERT INTO exchange_listings(id,shift_id,listed_by,closes_at) VALUES($1,$2,$3,LEAST($4::timestamptz,($5::date+time '19:00') AT TIME ZONE 'Europe/Minsk'))",
-        [id, s.id, s.user_id, s.start_at, s.date],
+        "INSERT INTO exchange_listings(id,shift_id,listed_by,closes_at) VALUES($1,$2,$3,$4)",
+        [id, s.id, s.user_id, exchangeDeadline(s.start_at)],
       );
       await sql.query("UPDATE shifts SET version=version+1 WHERE id=$1", [
         s.id,
@@ -1006,7 +1011,7 @@ export async function createApp(
     )[0];
     if (!u) fail("INACTIVE_USER", "Сотрудник неактивен", 403);
     const rate = rateFor(type, u, s.rate_override ? s.rate : null);
-    const pay_type = s.rate_override ? s.pay_type : type.pay_type;
+    const pay_type = s.rate_override ? s.pay_type : payTypeFor(type, u);
     const minutes = Math.round(
       (new Date(s.end_at).getTime() - new Date(s.start_at).getTime()) / 60000,
     );
@@ -1023,11 +1028,11 @@ export async function createApp(
     db.tx(async (sql) => {
       const l = (
         await sql.query(
-          "SELECT * FROM exchange_listings WHERE id=$1 AND status='open'",
+          "SELECT * FROM exchange_listings WHERE id=$1",
           [paramsId(req)],
         )
       )[0];
-      if (!l) fail("EXCHANGE_ALREADY_TAKEN", "Эту смену уже забрали", 409);
+      assertOpenListing(l, await time(sql));
       const s = await shiftForUpdate(sql, l.shift_id);
       return quote(sql, s, req.user.id);
     }),
@@ -1067,8 +1072,7 @@ export async function createApp(
             [id],
           )
         )[0];
-      if (l.status !== "open")
-        fail("EXCHANGE_ALREADY_TAKEN", "Эту смену уже забрали", 409);
+      assertOpenListing(l, await time(sql));
       if (s.user_id === req.user.id)
         fail("OWN_SHIFT", "Нельзя забрать свою смену", 409);
       const q = await quote(sql, s, req.user.id);
@@ -1133,7 +1137,7 @@ export async function createApp(
               [id],
             )
           )[0];
-        if (l.status !== "taken" || s.user_id !== l.taken_by)
+        if (l.status !== "taken" || s.user_id !== l.taken_by || !["planned", "confirmed"].includes(s.status))
           fail(
             "ROLLBACK_CONFLICT",
             "Назначение уже изменилось. Используйте редактор смены",
@@ -1196,6 +1200,8 @@ export async function createApp(
             })
             .parse(req.body),
           s = await shiftForUpdate(sql, paramsId(req));
+        if (b.minutes === 0 && Number(b.amount) === 0)
+          fail("EMPTY_ADJUSTMENT", "Укажите изменение минут или суммы");
         if (!s.user_id || s.status === "cancelled")
           fail(
             "INVALID_SHIFT",
@@ -1245,7 +1251,7 @@ export async function createApp(
         );
         await notify(
           sql,
-          [s.user_id, ...(await admins(sql))],
+          [s.user_id, ...(await admins(sql))].filter((recipient) => recipient !== req.user.id),
           "Корректировка начислений",
           b.reason,
           "adjustments",
@@ -1294,6 +1300,11 @@ export async function createApp(
       "UPDATE notifications SET read_at=clock_timestamp() WHERE user_id=$1 AND read_at IS NULL",
       [req.user.id],
     );
+    return { ok: true };
+  });
+  route("POST", "/notifications/:id/read", async (req) => {
+    await db.query("UPDATE notifications SET read_at=COALESCE(read_at,clock_timestamp()) WHERE id=$1 AND user_id=$2", [paramsId(req), req.user.id]);
+    await db.query("INSERT INTO events DEFAULT VALUES");
     return { ok: true };
   });
   route(

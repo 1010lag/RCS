@@ -65,6 +65,15 @@ await db.tx(async (sql) => {
   const credentialAdmin = uid();
   await sql.query("INSERT INTO users(id,name,phone,role,password_hash) VALUES($1,'Доступ тест','+375299999979','admin',$2)", [credentialAdmin, password]);
   await sql.query("INSERT INTO sessions(id,user_id,csrf,expires_at) VALUES($1,$2,'credential-csrf',clock_timestamp()+interval '1 hour')", [createHash("sha256").update("credential-ui-test-session").digest("hex"), credentialAdmin]);
+  for (const [index, role] of ["admin", "barista"].entries()) {
+    const person = uid();
+    await sql.query("INSERT INTO users(id,name,phone,role,password_hash,rate) VALUES($1,$2,$3,$4,$5,15)", [person, `Регрессия ${role}`, `+37529999997${index}`, role, password]);
+    await sql.query("INSERT INTO sessions(id,user_id,csrf,expires_at) VALUES($1,$2,'regression-csrf',clock_timestamp()+interval '1 hour')", [createHash("sha256").update(`regression-${role}-session`).digest("hex"), person]);
+    if (role === "barista") {
+      await notify(sql, [person], "Проверка чтения", "Откройте уведомление", "schedule", "payroll");
+      await notify(sql, [person], "Второе уведомление", "Остаётся непрочитанным", "schedule", "schedule");
+    }
+  }
   await sql.query(
     "INSERT INTO shifts(id,date,start_at,end_at,type_id,user_id,status,pay_type,rate,comment) VALUES($1,$2,$3,$4,$5,$6,'confirmed','hourly',13,'Android exchange regression')",
     [uid(), nativeDay, dateTime(nativeDay, "08:00"), dateTime(nativeDay, "15:00"), type, ids[1]],

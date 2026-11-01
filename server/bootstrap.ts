@@ -22,7 +22,7 @@ try {
     process.env.ADMIN_PASSWORD ??
     (await rl.question("Новый пароль (от 10 символов, ввод видимый): "));
   rl.close();
-  if (!name || password.length < 10)
+  if (!name || password.trim().length < 10 || password.length > 128)
     throw new Error("Имя обязательно, пароль — от 10 символов");
   const hashed = await hash(password),
     id = uid();

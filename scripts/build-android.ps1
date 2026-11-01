@@ -29,10 +29,31 @@ if ($LASTEXITCODE -ne 0) { throw 'Web build failed' }
 if ($LASTEXITCODE -ne 0) { throw 'Android sync failed' }
 Push-Location -LiteralPath android
 try {
-    & .\gradlew.bat --no-daemon --max-workers=2 :app:assembleDebug
+    & .\gradlew.bat --no-daemon --max-workers=2 :app:assembleRelease
     if ($LASTEXITCODE -ne 0) { throw 'APK build failed' }
 } finally { Pop-Location }
+$releaseApk = (Resolve-Path -LiteralPath 'android\app\build\outputs\apk\release\app-release.apk').Path
+$buildTools = Get-ChildItem -LiteralPath (Join-Path $env:ANDROID_HOME 'build-tools') -Directory | Sort-Object Name -Descending | Select-Object -First 1
+$verificationApk = Join-Path $toolsRoot ('rcs-verify-' + [guid]::NewGuid().ToString('N') + '.apk')
+# Windows aapt cannot open a Cyrillic workspace path. Verify an identical copy.
+Copy-Item -LiteralPath $releaseApk -Destination $verificationApk
+try {
+    $metadata = & (Join-Path $buildTools.FullName 'aapt.exe') dump badging $verificationApk
+    if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the APK manifest' }
+    if ($metadata | Select-String '^application-debuggable') { throw 'Refusing to distribute a debuggable APK' }
+    & (Join-Path $buildTools.FullName 'apksigner.bat') verify $verificationApk
+    if ($LASTEXITCODE -ne 0) { throw 'APK signature verification failed' }
+} finally { Remove-Item -LiteralPath $verificationApk -Force }
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$archive = [System.IO.Compression.ZipFile]::OpenRead($releaseApk)
+try {
+    $entry = $archive.GetEntry('assets/capacitor.config.json')
+    if (-not $entry) { throw 'APK configuration is missing' }
+    $reader = [System.IO.StreamReader]::new($entry.Open())
+    try { $apkConfig = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
+    if ($apkConfig.loggingBehavior -ne 'none' -or $apkConfig.android.loggingBehavior -ne 'none' -or $apkConfig.android.webContentsDebuggingEnabled -ne $false) { throw 'Refusing to distribute an APK with logging or WebView debugging enabled' }
+} finally { $archive.Dispose() }
 New-Item -ItemType Directory -Path '.data\apk' -Force | Out-Null
-Copy-Item -LiteralPath 'android\app\build\outputs\apk\debug\app-debug.apk' -Destination '.data\apk\RCS.apk' -Force
+Copy-Item -LiteralPath $releaseApk -Destination '.data\apk\RCS.apk' -Force
 Get-Item -LiteralPath '.data\apk\RCS.apk' | Select-Object FullName,Length
 Get-FileHash -LiteralPath '.data\apk\RCS.apk' -Algorithm SHA256

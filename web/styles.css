@@ -1286,8 +1286,14 @@ table tbody tr:last-child td {
 }
 .month-pager h2 {
   margin: 0;
-  text-transform: capitalize;
+  text-transform: none;
 }
+.month-pager h2::first-letter { text-transform: uppercase; }
+.payroll-totals { margin-bottom: 24px; }
+.audit-detail { display: block; margin-top: 5px; color: var(--text-muted); }
+.shift-chip.cancelled { opacity: .65; border-style: dashed; }
+.shift-chip.cancelled .chip-time { text-decoration: line-through; }
+.chip-status { display: block; font-size: 10px; margin-top: 3px; }
 .payroll-numbers {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -1859,7 +1865,7 @@ table tbody tr:last-child td {
   border-radius: 50%;
 }
 .month-add:hover { background: var(--surface-pressed, #ededf1); }
-.month-more { border: 0; background: transparent; text-align: left; font-size: 11px; color: var(--text-secondary, #62626d); padding: 1px 5px; border-radius: 4px; }
+.month-more { border: 0; background: transparent; text-align: left; font-size: 11px; color: var(--text-secondary, #62626d); padding: 3px 2px; border-radius: 4px; min-width: 0; width: 100%; line-height: 1.4; white-space: nowrap; overflow: visible; }
 .month-more:hover { background: var(--surface-pressed, #ededf1); }
 @media (hover: hover) and (pointer: fine) {
   .month-add { opacity: 0; }
@@ -2762,7 +2768,7 @@ table tbody tr:last-child td {
     min-height: 40px;
     justify-content: center;
   }
-  .month-grid { grid-auto-rows: 88px; }
+  .month-grid { grid-auto-rows: minmax(104px, auto); }
   .month-weekdays { font-size: 12px; padding: 10px 0; }
   .month-cell { padding: 4px 2px; }
   .month-date-header { min-height: 44px; margin-bottom: 2px; align-items: flex-start; }
@@ -2772,6 +2778,9 @@ table tbody tr:last-child td {
   .month-add { display: none; }
   .month-cell .shift-chip { width: 20px; padding: 0; border: 0; background: transparent; }
   .month-cell .chip-time { display: none; }
+  .month-cell .chip-status { display: none; }
+  .month-cell .shift-chip.cancelled { position: relative; }
+  .month-cell .shift-chip.cancelled::after { content: "×"; position: absolute; right: -2px; bottom: -2px; font-size: 13px; line-height: 13px; color: var(--text-primary); background: var(--surface); border-radius: 50%; }
   .month-cell .shift-chip > .chip-owner { justify-content: center; margin: 0; }
   .month-cell .chip-owner > span:last-child { display: none; }
   .month-cell .chip-owner .avatar.small { width: 20px; height: 20px; font-size: 8px; }

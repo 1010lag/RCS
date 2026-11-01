@@ -201,7 +201,7 @@ test("admin changes a barista hourly rate from their team card", async ({
   await card.getByRole("button", { name: "Изменить ставку в час" }).click();
   const dialog = page.getByRole("dialog");
   await dialog.getByLabel("Ставка в час, Br", { exact: true }).fill("17.50");
-  await dialog.getByLabel("Пересчитать будущие почасовые смены").uncheck();
+  await dialog.getByLabel("Пересчитать будущие смены по ставке сотрудника").uncheck();
   await dialog
     .getByLabel("Причина изменения", { exact: true })
     .fill("Повышение почасовой ставки");
@@ -369,9 +369,10 @@ test("admin can cancel or confirm employee and shift type removal on mobile", as
   await dialog.getByRole("button", { name: "Удалить сотрудника", exact: true }).click();
   await expect(page.getByRole("status")).toContainText("Сотрудник удалён из команды");
   await expect(card).toHaveCount(0);
-  await expect(calendarShift).toHaveCount(0, { timeout: 5000 });
+  await expect(calendarShift).toHaveCount(1, { timeout: 5000 });
+  await expect(calendarShift).toContainText("Отменена");
   const schedule = await (await page.request.get(`/api/schedule?from=${scheduledDay}&to=${scheduledDay}`)).json();
-  expect(schedule.some((item: any) => item.id === shiftId)).toBe(false);
+  expect(schedule.find((item: any) => item.id === shiftId).status).toBe("cancelled");
   expect((await (await page.request.get(`/api/shifts/${shiftId}`)).json()).status).toBe("cancelled");
   await calendarPage.close();
   await page.getByRole("button", { name: "Архив сотрудников", exact: true }).click();
@@ -489,6 +490,8 @@ test("Android portrait at 9:16 keeps app controls within the phone screen", asyn
   await page.evaluate((id) => { location.hash = `shift:${id}`; }, shiftId);
   const dialog = page.getByRole("dialog");
   await dialog.getByRole("button", { name: "Выставить на биржу" }).click();
+  await expect(dialog).toContainText("сотрудники получат уведомления");
+  await dialog.getByRole("button", { name: "Подтвердить публикацию" }).click();
   await expect(page.getByRole("status")).toContainText("Смена выставлена на биржу");
   await page.locator(".bottom-nav").getByRole("button", { name: "Сегодня", exact: true }).click();
   await page.evaluate((id) => { location.hash = `shift:${id}`; }, shiftId);
@@ -729,4 +732,116 @@ test("admin edits employee login data and their own phone and password", async (
   const me = await page.request.get("/api/auth/me");
   expect(me.ok()).toBe(true);
   expect((await me.json()).user.phone).toBe("+375299999991");
+});
+
+async function regressionSession(page: Page, role = "admin") {
+  await page.context().addCookies([{ name: "rcs_session", value: `regression-${role}-session`, url: "http://127.0.0.1:3181", httpOnly: true, sameSite: "Strict" }]);
+}
+test("opening one notification decreases the bell count and keeps other notices unread", async ({ page }) => {
+  await regressionSession(page, "barista");
+  await page.goto("/#notifications");
+  await expect(page.locator(".notice").filter({ hasText: "Проверка чтения" })).toBeVisible();
+  const before = await page.locator(".notice.new").count();
+  await expect(page.locator(".bell-btn")).toHaveAttribute("aria-label", `Уведомления: ${before}`);
+  await page.locator(".notice").filter({ hasText: "Проверка чтения" }).click();
+  await expect(page.locator(".month-pager")).toBeVisible();
+  await expect(page.locator(".bell-btn")).toHaveAttribute("aria-label", `Уведомления: ${before - 1}`);
+  await page.locator(".bell-btn").click();
+  await expect(page.locator(".notice.new")).toHaveCount(before - 1);
+  await expect(page.locator(".notice.new").filter({ hasText: "Второе уведомление" })).toBeVisible();
+});
+test("a throttled action does not leave an error in the next dialog", async ({ page }) => {
+  await regressionSession(page);
+  await page.goto("/#profile");
+  await page.route("**/api/me/name", (route) => route.fulfill({ status: 429, json: { code: "RATE_LIMITED", message: "Слишком много попыток. Попробуйте позже" } }));
+  await page.getByRole("button", { name: "Изменить имя и фамилию" }).click();
+  const dialog = page.getByRole("dialog");
+  await dialog.getByRole("button", { name: "Сохранить", exact: true }).click();
+  await expect(dialog.getByRole("alert")).toContainText("Слишком много попыток");
+  await dialog.getByRole("button", { name: "Отмена", exact: true }).click();
+  await page.getByRole("button", { name: "Изменить телефон и пароль" }).click();
+  await expect(dialog.getByRole("alert")).toHaveCount(0);
+});
+test("month overflow labels fit and unassigned and cancelled shifts have clear statuses", async ({ page }) => {
+  await page.setViewportSize({ width: 360, height: 640 });
+  await regressionSession(page);
+  const types = await (await page.request.get("/api/shift-types")).json();
+  const me = await (await page.request.get("/api/auth/me")).json();
+  const day = new Date(Date.parse(me.server_now) + 3 * 86400000).toISOString().slice(0, 10);
+  const created: string[] = [];
+  for (const hour of [8, 10, 12]) {
+    const r = await page.request.post("/api/shifts", { headers: { "X-CSRF-Token": "regression-csrf" }, data: { date: day, start_time: `${hour.toString().padStart(2, "0")}:00`, end_time: `${(hour + 1).toString().padStart(2, "0")}:00`, type_id: types[0].id, user_id: null, status: hour === 10 ? "cancelled" : "confirmed" } });
+    expect(r.ok(), await r.text()).toBe(true);
+    created.push((await r.json()).id);
+  }
+  await page.goto(`/#shift:${created[0]}`);
+  let dialog = page.getByRole("dialog");
+  await expect(dialog.locator(".tag").first()).toHaveText("Не назначена");
+  await expect(dialog.locator(".detail-person .avatar")).toHaveText("?");
+  await dialog.getByRole("button", { name: "Закрыть диалог" }).click();
+  await page.goto("/#schedule");
+  await page.getByRole("button", { name: "Месяц", exact: true }).click();
+  const cell = page.locator(`.month-cell[data-date="${day}"]`);
+  const more = cell.locator(".month-more");
+  await expect(more).toHaveText("Ещё 1");
+  const dimensions = await more.evaluate((button) => {
+    const range = document.createRange(); range.selectNodeContents(button);
+    const text = range.getBoundingClientRect(), bounds = button.getBoundingClientRect(), cell = button.closest(".month-cell")!.getBoundingClientRect();
+    return { textWidth: text.width, buttonWidth: bounds.width, textRight: text.right, cellRight: cell.right, textBottom: text.bottom, cellBottom: cell.bottom };
+  });
+  expect(dimensions.textWidth).toBeLessThanOrEqual(dimensions.buttonWidth);
+  expect(dimensions.textRight).toBeLessThanOrEqual(dimensions.cellRight);
+  expect(dimensions.textBottom).toBeLessThanOrEqual(dimensions.cellBottom);
+  await expect(cell.locator(".shift-chip.cancelled")).toHaveCount(1);
+  await page.screenshot({ path: ".data/qa/regression-month-more.png", fullPage: true });
+});
+test("payroll totals sum employees and weeks", async ({ page }) => {
+  await regressionSession(page);
+  await page.route("**/api/payroll?*", async (route) => {
+    // Use dates inside the selected month, independent of its surrounding grid.
+    const selected = new Date();
+    const month = new Intl.DateTimeFormat("sv-SE", { timeZone: "Europe/Minsk", year: "numeric", month: "2-digit" }).format(selected);
+    await route.fulfill({ json: [
+      { user_id: "a", name: "Первый", date: `${month}-02`, minutes: 60, amount: "20.10", planned_minutes: 120, planned_amount: "40.00" },
+      { user_id: "a", name: "Первый", date: `${month}-03`, minutes: 90, amount: "30.20", planned_minutes: 30, planned_amount: "10.00" },
+      { user_id: "b", name: "Второй", date: `${month}-03`, minutes: 60, amount: "10.00", planned_minutes: 60, planned_amount: "15.00" },
+    ] });
+  });
+  await page.goto("/#payroll");
+  const employeeTable = page.locator(".payroll-totals").filter({ hasText: "Итоги по сотрудникам" });
+  await expect(employeeTable.locator("tbody tr").filter({ hasText: "Первый" })).toContainText("50,30 Br");
+  const weeks = page.locator(".payroll-totals").filter({ hasText: "Итоги по неделям" });
+  await expect(weeks.locator("tbody")).toContainText("60,30 Br");
+});
+test("signing in as a different account starts at Today with the personal cards", async ({ page }) => {
+  await regressionSession(page);
+  await page.goto("/#profile");
+  await page.getByRole("button", { name: "Выйти из аккаунта" }).click();
+  await page.getByLabel("Телефон", { exact: true }).fill("80 29 999 99 71");
+  await page.getByLabel("Пароль", { exact: true }).fill("BrowserTests!2026");
+  await page.getByRole("button", { name: "Войти в RCS" }).click();
+  await expect(page.locator(".hero-card")).toBeVisible();
+  await expect(page.locator(".stat-card").filter({ hasText: "Завтра" })).toBeVisible();
+  await expect(page.locator(".stat-card").filter({ hasText: "Заработано сегодня" })).toBeVisible();
+  await expect(page).toHaveURL(/#home$/);
+});
+test("Tomorrow includes the next month when the current calendar grid ends today", async ({ page }) => {
+  await regressionSession(page, "barista");
+  const me = await (await page.request.get("/api/auth/me")).json();
+  await page.route("**/api/auth/me", async (route) => {
+    const response = await route.fetch();
+    await route.fulfill({ response, json: { ...await response.json(), server_now: "2027-02-28T12:00:00+03:00" } });
+  });
+  await page.route("**/api/me/shifts?*", async (route) => {
+    const to = new URL(route.request().url()).searchParams.get("to")!;
+    await route.fulfill({ json: to >= "2027-03-01" ? [{
+      id: "00000000-0000-4000-8000-000000000001", date: "2027-03-01", user_id: me.user.id, user_name: me.user.name,
+      start_time: "08:00", end_time: "12:00", start_at: "2027-03-01T08:00:00+03:00", end_at: "2027-03-01T12:00:00+03:00",
+      type_name: "Открытие", status: "confirmed", amount: "60.00",
+    }] : [] });
+  });
+  await page.goto("/#home");
+  const tomorrow = page.locator(".stat-card").filter({ hasText: "Завтра" });
+  await expect(tomorrow).toContainText("1смена");
+  await expect(tomorrow).toContainText("08:00–12:00");
 });

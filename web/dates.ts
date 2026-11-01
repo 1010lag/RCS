@@ -56,3 +56,7 @@ export const initials = (name: string) =>
     .map((w) => w[0])
     .slice(0, 2)
     .join("");
+export function plural(n: number, one: string, few: string, many: string) {
+  const mod = Math.abs(n) % 100;
+  return mod >= 11 && mod <= 14 ? many : mod % 10 === 1 ? one : mod % 10 >= 2 && mod % 10 <= 4 ? few : many;
+}

@@ -73,6 +73,14 @@ CREATE INDEX IF NOT EXISTS notifications_user ON notifications(user_id,created_a
 -- statement
 CREATE INDEX IF NOT EXISTS exchange_expiry ON exchange_listings(status,closes_at);
 -- statement
+ALTER TABLE exchange_listings DROP CONSTRAINT IF EXISTS exchange_listings_status_check;
+-- statement
+ALTER TABLE exchange_listings ADD CONSTRAINT exchange_listings_status_check CHECK(status IN ('open','taken','cancelled','expired','rolled_back','closed'));
+-- statement
+UPDATE exchange_listings l SET status='closed' WHERE l.status='cancelled' AND NOT EXISTS (SELECT 1 FROM audit_logs a WHERE a.entity='exchange' AND a.entity_id=l.id AND a.action='Объявление отозвано');
+-- statement
+UPDATE exchange_listings l SET closes_at=(CASE WHEN (s.start_at AT TIME ZONE 'Europe/Minsk')::time <= time '10:00' THEN s.date-1+time '19:00' ELSE LEAST(s.start_at AT TIME ZONE 'Europe/Minsk',s.date+time '19:00') END) AT TIME ZONE 'Europe/Minsk' FROM shifts s WHERE s.id=l.shift_id AND l.status='open';
+-- statement
 CREATE TABLE IF NOT EXISTS request_limits (key text PRIMARY KEY,hits integer NOT NULL,resets_at timestamptz NOT NULL);
 -- statement
 CREATE INDEX IF NOT EXISTS request_limits_expiry ON request_limits(resets_at);

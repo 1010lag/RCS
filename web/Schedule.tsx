@@ -7,6 +7,7 @@ import {
   Search,
 } from "lucide-react";
 import type { Shift } from "../shared/types";
+import { statusLabels } from "../shared/types";
 import { Avatar, Empty } from "./App";
 import {
   addDays,
@@ -14,6 +15,7 @@ import {
   monthGridRange,
   moveMonth,
   label,
+  plural,
 } from "./dates";
 type Props = {
   shifts: Shift[];
@@ -49,7 +51,7 @@ export function Schedule({
     mineIds = new Set(mine.map((s) => s.id));
   const source = (
     onlyMine ? shifts.filter((s) => mineIds.has(s.id)) : shifts
-  ).filter((s) => s.status !== "cancelled");
+  );
   const staffById = new Map<string, { id: string; name: string; avatar_url?: string | null; archived?: boolean }>(team.map((user) => [user.id, user]));
   for (const shift of source) {
     if (shift.user_id && !staffById.has(shift.user_id)) staffById.set(shift.user_id, { id: shift.user_id, name: shift.user_name ?? "Сотрудник в архиве", avatar_url: shift.user_avatar_url, archived: true });
@@ -79,9 +81,9 @@ export function Schedule({
     return (
       <button
         key={s.id}
-        aria-label={`${s.user_name ?? "Не назначена"}, ${s.start_time}–${s.end_time}, ${s.type_name}`}
+        aria-label={`${s.user_name ?? "Не назначена"}, ${s.start_time}–${s.end_time}, ${s.type_name}, ${statusLabels[s.status]}`}
         onClick={() => open(s)}
-        className={`shift-chip ${s.exchange_id ? "exchange" : s.type_name.toLowerCase().includes("закрыт") ? "closing" : ""}`}
+        className={`shift-chip ${s.status === "cancelled" ? "cancelled" : s.exchange_id ? "exchange" : s.type_name.toLowerCase().includes("закрыт") ? "closing" : ""}`}
       >
         <span className="chip-time">
           {s.start_time} – {s.end_time}
@@ -90,7 +92,9 @@ export function Schedule({
           {s.type_name}
           {s.exchange_id && <i />}
         </span>
-        {mode === "month" && <span className="chip-owner"><Avatar name={s.user_name ?? "Не назначена"} src={s.user_avatar_url} small /><span>{s.user_name ?? "Не назначена"}</span></span>}
+        {s.status === "cancelled" && <span className="chip-status">Отменена</span>}
+        {!s.user_id && s.status !== "cancelled" && <span className="chip-status">Не назначена</span>}
+        {mode === "month" && <span className="chip-owner"><Avatar name={s.user_name ?? "?"} src={team.find((u) => u.id === s.user_id)?.avatar_url} small /><span>{s.user_name ?? "Не назначена"}</span></span>}
       </button>
     );
   }
@@ -244,7 +248,7 @@ export function Schedule({
                               visibleDays.includes(s.date),
                           ).length
                         }{" "}
-                        смен на период
+                        {plural(source.filter((s) => s.user_id === u.id && visibleDays.includes(s.date)).length, "смена", "смены", "смен")} на период
                       </small>
                     </span>
                   </th>

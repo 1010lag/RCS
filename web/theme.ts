@@ -1,11 +1,12 @@
 import { useSyncExternalStore } from "react";
 import { App as NativeApp } from "@capacitor/app";
-import { SystemBars, SystemBarsStyle } from "@capacitor/core";
+import { SystemBars, SystemBarsStyle, registerPlugin } from "@capacitor/core";
 import { nativeApp } from "./runtime";
 
 export type Theme = "light" | "dark";
 const key = "rcs-theme";
 const listeners = new Set<() => void>();
+const Appearance = registerPlugin<{ setTheme(options: { theme: Theme }): Promise<void> }>("Appearance");
 function savedTheme(): Theme {
   try { return localStorage.getItem(key) === "dark" ? "dark" : "light"; }
   catch { return "light"; }
@@ -16,7 +17,9 @@ function syncAppearance() {
   const color = theme === "dark" ? "#18181c" : "#ffffff";
   document.querySelector('meta[name="theme-color"]')?.setAttribute("content", color);
   if (nativeApp) {
-    void SystemBars.setStyle({ style: theme === "dark" ? SystemBarsStyle.Dark : SystemBarsStyle.Light }).catch(() => {});
+    const appearance = theme;
+    void SystemBars.setStyle({ style: appearance === "dark" ? SystemBarsStyle.Dark : SystemBarsStyle.Light })
+      .then(() => Appearance.setTheme({ theme: appearance })).catch(() => {});
   }
 }
 export function initializeTheme() {

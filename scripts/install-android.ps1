@@ -5,6 +5,7 @@ param(
     [switch]$VerifyUI
 )
 $ErrorActionPreference = 'Stop'
+if ($VerifyUI) { throw 'Release APKs disable the WebView debugger. Run browser UI checks with npm run test:e2e; use this script without -VerifyUI to install and capture a release APK.' }
 Set-Location -LiteralPath (Split-Path -Parent $PSScriptRoot)
 $sdkDirectory = if ($env:ANDROID_HOME) { $env:ANDROID_HOME } else { Join-Path $env:USERPROFILE '.codex\.tmp\rcs-android-sdk' }
 $adbExecutable = Join-Path $sdkDirectory 'platform-tools\adb.exe'

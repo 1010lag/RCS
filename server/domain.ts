@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { notificationText } from "./notification-text";
 import type { Sql } from "./db";
 import type { User, PayType } from "../shared/types";
+import { exchangeDeadline } from "../shared/exchange-window";
 export class Problem extends Error {
   constructor(
     public status: number,
@@ -25,11 +26,13 @@ export const money = (value: unknown): string => {
   return Number(s).toFixed(2);
 };
 export function phone(value: string): string {
-  const p = value.replace(/[\s()\-]/g, "");
-  if (!/^\+\d{10,15}$/.test(p))
+  let p = value.replace(/[\s()\-]/g, "");
+  if (/^80\d{9}$/.test(p)) p = "+375" + p.slice(2);
+  if (/^375\d{9}$/.test(p)) p = "+" + p;
+  if (!/^\+375\d{9}$/.test(p))
     fail(
       "INVALID_PHONE",
-      "Введите телефон в международном формате, например +375291234567",
+      "Введите белорусский телефон: +375291234567 или 80291234567",
     );
   return p;
 }
@@ -174,10 +177,10 @@ export async function assertExchange(sql: Sql, shift: any, time?: Date) {
   const t = time ?? (await now(sql));
   if (t >= new Date(shift.start_at))
     fail("SHIFT_STARTED", "Смена уже началась", 409);
-  if (t >= new Date(`${shift.date}T19:00:00+03:00`))
+  if (t >= exchangeDeadline(shift.start_at))
     fail(
       "EXCHANGE_DEADLINE_PASSED",
-      "Биржа закрыта: наступило 19:00 по Минску",
+      "Срок передачи смены истёк. Биржа работает с 10:00 до 19:00 по Минску",
       409,
     );
   const type = (
@@ -189,7 +192,7 @@ export async function assertExchange(sql: Sql, shift: any, time?: Date) {
   if (
     shift.exchanged ||
     shift.exchange_locked ||
-    !type.active ||
+    !type?.active ||
     !type.allow_exchange ||
     ["cancelled", "worked", "closed"].includes(shift.status)
   )
@@ -197,26 +200,38 @@ export async function assertExchange(sql: Sql, shift: any, time?: Date) {
   return type;
 }
 export async function assertUnadjusted(sql: Sql, shiftId: string) {
-  if ((await sql.query("SELECT id FROM adjustments WHERE shift_id=$1 LIMIT 1", [shiftId])).length)
+  if ((await sql.query("SELECT id FROM adjustments WHERE shift_id=$1 AND (minutes<>0 OR amount<>0) LIMIT 1", [shiftId])).length)
     fail("ADJUSTED_OWNER", "У смены есть персональные корректировки. Передача и откат владельца запрещены", 409);
 }
 export async function closeListing(sql: Sql, shiftId: string) {
-  await sql.query(
-    "UPDATE exchange_listings SET status='cancelled' WHERE shift_id=$1 AND status='open'",
+  const listings = await sql.query(
+    "UPDATE exchange_listings SET status='closed' WHERE shift_id=$1 AND status='open' RETURNING id,listed_by",
     [shiftId],
   );
+  for (const listing of listings) {
+    await notify(sql, [listing.listed_by], "Объявление закрыто", "Объявление автоматически закрыто из-за изменения смены или её типа. Проверьте назначение в графике.", "exchange", `shift:${shiftId}`);
+    await audit(sql, null, "Объявление закрыто автоматически", "exchange", listing.id, null, { shift_id: shiftId });
+  }
+}
+export function payTypeFor(type: any, user: any): PayType {
+  return type.pay_type === "hourly" && user?.rate != null ? user.pay_type : type.pay_type;
+}
+export function positiveRate(value: string) {
+  const rate = money(value);
+  if (Number(rate) <= 0) fail("INVALID_RATE", "Ставка должна быть больше 0 Br");
+  return rate;
 }
 export function rateFor(type: any, user: any, override?: string | null) {
   if (override != null) return money(override);
   if (type.pay_type === "hourly") {
     if (!user) return "0.00";
-    if (user.rate == null || user.pay_type !== "hourly")
-      return fail("EMPLOYEE_RATE_REQUIRED", "Сначала укажите почасовую ставку сотрудника в разделе «Команда»");
-    return money(user.rate);
+    if (user.rate == null)
+      return fail("EMPLOYEE_RATE_REQUIRED", "Для расчёта оплаты не задана ставка сотрудника. Обратитесь к администратору");
+    return positiveRate(user.rate);
   }
   return user?.rate != null && user.pay_type === "shift" ? user.rate : type.rate;
 }
-export const shiftProjection = `s.id, s.date::text, to_char(s.start_at AT TIME ZONE 'Europe/Minsk','HH24:MI') AS start_time, to_char(s.end_at AT TIME ZONE 'Europe/Minsk','HH24:MI') AS end_time, s.start_at, s.end_at, s.type_id, t.name AS type_name, s.user_id, u.name AS user_name, u.avatar_url AS user_avatar_url, s.status, s.version, s.exchanged, s.exchange_locked, (t.allow_exchange AND t.active AND NOT EXISTS (SELECT 1 FROM adjustments ax WHERE ax.shift_id=s.id)) AS exchange_allowed, l.id AS exchange_id, LEAST(s.start_at, (s.date + time '19:00') AT TIME ZONE 'Europe/Minsk') AS closes_at`;
+export const shiftProjection = `s.id, s.date::text, to_char(s.start_at AT TIME ZONE 'Europe/Minsk','HH24:MI') AS start_time, to_char(s.end_at AT TIME ZONE 'Europe/Minsk','HH24:MI') AS end_time, s.start_at, s.end_at, s.type_id, t.name AS type_name, s.user_id, u.name AS user_name, s.status, s.version, s.exchanged, s.exchange_locked, (t.allow_exchange AND t.active AND NOT EXISTS (SELECT 1 FROM adjustments ax WHERE ax.shift_id=s.id AND (ax.minutes<>0 OR ax.amount<>0))) AS exchange_allowed, l.id AS exchange_id, (CASE WHEN (s.start_at AT TIME ZONE 'Europe/Minsk')::time <= time '10:00' THEN s.date-1+time '19:00' ELSE LEAST(s.start_at AT TIME ZONE 'Europe/Minsk',s.date+time '19:00') END) AT TIME ZONE 'Europe/Minsk' AS closes_at`;
 export const shiftJoins = `FROM shifts s JOIN shift_types t ON t.id=s.type_id LEFT JOIN users u ON u.id=s.user_id LEFT JOIN exchange_listings l ON l.shift_id=s.id AND l.status='open' AND l.closes_at>clock_timestamp()`;
 export const financeProjection = `, (EXTRACT(EPOCH FROM (s.end_at-s.start_at))/60)::integer AS minutes, s.rate::text, s.pay_type, s.comment, COALESCE(a.minutes,0)::integer AS adjustment_minutes, COALESCE(a.amount,0)::text AS adjustment_amount, (CASE WHEN s.pay_type='shift' THEN s.rate ELSE round(((EXTRACT(EPOCH FROM(s.end_at-s.start_at))/60)+COALESCE(a.minutes,0))*s.rate/60,2) END + COALESCE(a.amount,0))::text AS amount`;
 export const adjustmentJoin = `LEFT JOIN (SELECT shift_id,user_id,sum(minutes) AS minutes,sum(amount) AS amount FROM adjustments GROUP BY shift_id,user_id) a ON a.shift_id=s.id AND a.user_id=s.user_id`;

@@ -141,6 +141,112 @@ afterAll(async () => {
   await app?.close();
   await db?.close();
 });
+describe("Reported logic regressions", () => {
+  it("assigns and transfers employee-rate shifts to a fixed-pay employee without treating their rate as hourly", async () => {
+    await db.query("UPDATE users SET rate=90,pay_type='shift' WHERE id=$1", [ids[2]]);
+    const assigned = await shift(ids[2], { start_time: "08:00", end_time: "10:00" });
+    expect((await call(b, "GET", `/shifts/${assigned}`)).json()).toMatchObject({ rate: "90.00", pay_type: "shift", amount: "90.00" });
+    const id = await shift(), listing = await list(id), q = await quote(listing);
+    expect(q).toMatchObject({ rate: "90.00", pay_type: "shift", amount: "90.00" });
+    expect((await call(b, "POST", `/exchange/${listing}/take`, { version: q.version }, uid())).statusCode).toBe(200);
+    expect((await call(b, "GET", `/shifts/${id}`)).json().amount).toBe("90.00");
+  });
+  it("rejects zero adjustments without side effects and ignores legacy zero adjustments for transfer", async () => {
+    const id = await shift(), listing = await list(id);
+    const before = (await call(a, "GET", "/notifications")).json().length;
+    const rejected = await call(admin, "POST", `/shifts/${id}/adjustments`, { minutes: 0, amount: "-0.00", reason: "Пустая корректировка" });
+    expect(rejected.json().code).toBe("EMPTY_ADJUSTMENT");
+    expect(await db.query("SELECT id FROM adjustments WHERE shift_id=$1", [id])).toHaveLength(0);
+    expect((await call(a, "GET", "/notifications")).json()).toHaveLength(before);
+    await db.query("INSERT INTO adjustments(id,shift_id,user_id,minutes,amount,reason,created_by) VALUES($1,$2,$3,0,0,'Старая пустая запись',$4)", [uid(), id, ids[1], ids[0]]);
+    expect((await call(a, "GET", `/shifts/${id}`)).json().exchange_allowed).toBe(true);
+    expect((await call(b, "GET", "/exchange")).json().some((l: any) => l.id === listing)).toBe(true);
+    const q = await quote(listing);
+    expect((await call(b, "POST", `/exchange/${listing}/take`, { version: q.version }, uid())).statusCode).toBe(200);
+  });
+  it("rejects blank and unchanged passwords in password and employee editors", async () => {
+    for (const password of ["          ", "TestPassword!2026"]) {
+      const r = await call(a, "POST", "/auth/password", { current: "TestPassword!2026", password });
+      expect(r.statusCode).toBe(422);
+      const edited = await call(admin, "PATCH", `/employees/${ids[1]}`, { name: "Анна", phone: "+375290000001", rate: "14.00", pay_type: "hourly", active: true, version: 1, reason: "Проверка пароля", current_password: "TestPassword!2026", password });
+      expect(edited.statusCode, edited.body).toBe(422);
+    }
+    expect((await call(a, "GET", "/auth/me")).statusCode).toBe(200);
+    const created = await call(admin, "POST", "/employees", { name: "Новый", phone: "+375299999998", password: "          " });
+    expect(created.statusCode).toBe(422);
+    await db.query("UPDATE users SET password_hash=$1 WHERE id=$2", [await hash("          "), ids[1]]);
+    const legacyLogin = await app.inject({ method: "POST", url: "/api/auth/login", remoteAddress: "192.0.2.198", payload: { phone: "+375290000001", password: "          " } });
+    expect(legacyLogin.statusCode).toBe(401);
+  });
+  it("rejects rollback after the received shift has been cancelled and sends no success notification", async () => {
+    const id = await shift(), listing = await list(id), q = await quote(listing);
+    expect((await call(b, "POST", `/exchange/${listing}/take`, { version: q.version }, uid())).statusCode).toBe(200);
+    const dismissed = await call(admin, "PATCH", `/employees/${ids[2]}`, { name: "Максим", phone: "+375290000002", rate: "16.00", pay_type: "hourly", active: false, version: 1, reason: "Увольнение" });
+    expect(dismissed.statusCode, dismissed.body).toBe(200);
+    const rollback = await call(admin, "POST", `/exchange/${listing}/rollback`, { reason: "Вернуть назначение" });
+    expect(rollback.json().code).toBe("ROLLBACK_CONFLICT");
+    expect((await db.query("SELECT status,user_id FROM shifts WHERE id=$1", [id]))[0]).toMatchObject({ status: "cancelled", user_id: ids[2] });
+    expect(await db.query("SELECT id FROM notifications WHERE title='Обмен отменён'")).toHaveLength(0);
+  });
+  it("distinguishes automatic closure and withdrawal from taken listings and notifies the owner", async () => {
+    const id = await shift(), listing = await list(id), q = await quote(listing);
+    const changed = await call(admin, "PATCH", `/shift-types/${typeId}`, { name: "Закрытие", start_time: "20:00", end_time: "22:00", pay_type: "hourly", allow_exchange: false, active: true, version: 1 });
+    expect(changed.statusCode).toBe(200);
+    expect((await call(a, "GET", "/exchange?history=true")).json().find((l: any) => l.id === listing).status).toBe("closed");
+    expect((await call(a, "GET", "/notifications")).json().some((n: any) => n.title === "Объявление закрыто")).toBe(true);
+    expect((await call(b, "GET", `/exchange/${listing}/quote`)).json().code).toBe("LISTING_CLOSED");
+    expect((await call(b, "POST", `/exchange/${listing}/take`, { version: q.version }, uid())).json().code).toBe("LISTING_CLOSED");
+    await db.query("UPDATE shift_types SET allow_exchange=true WHERE id=$1", [typeId]);
+    const other = await shift(ids[3]), withdrawn = await list(other, c);
+    expect((await call(c, "POST", `/exchange/${withdrawn}/withdraw`)).statusCode).toBe(200);
+    expect((await call(b, "GET", `/exchange/${withdrawn}/quote`)).json().code).toBe("LISTING_WITHDRAWN");
+  });
+  it("uses the preceding 19:00 for an early shift in detail, listing, quote and publication checks", async () => {
+    const previous = new Date(Date.parse(day) - 86400000).toISOString().slice(0, 10);
+    clock = new Date(`${previous}T18:00:00+03:00`);
+    const id = await shift(ids[1], { start_time: "08:00", end_time: "10:00" }), listing = await list(id);
+    const deadline = new Date(`${previous}T19:00:00+03:00`).toISOString();
+    expect(new Date((await call(a, "GET", `/shifts/${id}`)).json().closes_at).toISOString()).toBe(deadline);
+    expect(new Date((await call(b, "GET", "/exchange")).json().find((l: any) => l.id === listing).closes_at).toISOString()).toBe(deadline);
+    clock = new Date(`${previous}T19:00:00+03:00`);
+    expect((await call(b, "GET", `/exchange/${listing}/quote`)).json().code).toBe("LISTING_CLOSED");
+    const other = await shift(ids[3], { start_time: "08:00", end_time: "10:00" });
+    expect((await call(c, "POST", `/shifts/${other}/exchange`)).json().code).toBe("EXCHANGE_DEADLINE_PASSED");
+  });
+  it("marks only the selected owner's notification as read", async () => {
+    await shift();
+    const notice = (await call(a, "GET", "/notifications")).json()[0];
+    expect(notice.read_at).toBeNull();
+    expect((await call(b, "POST", `/notifications/${notice.id}/read`)).statusCode).toBe(200);
+    expect((await call(a, "GET", "/notifications")).json()[0].read_at).toBeNull();
+    await call(a, "POST", `/notifications/${notice.id}/read`);
+    expect((await call(a, "GET", "/notifications")).json()[0].read_at).not.toBeNull();
+  });
+  it("validates phone length, accepts domestic login, and explains duplicate phones and empty names in Russian", async () => {
+    const body = { name: "Новый", phone: "+3752912345678", password: "NewPassword!2026" };
+    expect((await call(admin, "POST", "/employees", body)).json().code).toBe("INVALID_PHONE");
+    expect((await call(admin, "POST", "/employees", { ...body, phone: "80 29 000 00 01" })).json()).toMatchObject({ code: "PHONE_TAKEN", message: "Этот телефон уже занят" });
+    expect((await call(admin, "POST", "/employees", { ...body, name: "  " })).json().message).toBe("Заполните поле");
+    const loggedIn = await app.inject({ method: "POST", url: "/api/auth/login", remoteAddress: "192.0.2.199", payload: { phone: "80 (29) 000-00-01", password: "TestPassword!2026" } });
+    expect(loggedIn.statusCode, loggedIn.body).toBe(200);
+  });
+  it("applies profile rate changes to future shifts when selected and rejects zero rates through both editors", async () => {
+    const id = await shift();
+    const body = { name: "Анна", phone: "+375290000001", rate: "21.00", pay_type: "hourly", active: true, version: 1, reason: "Повышение ставки", apply_to_future: true };
+    expect((await call(admin, "PATCH", `/employees/${ids[1]}`, { ...body, rate: "0" })).json().code).toBe("INVALID_RATE");
+    expect((await call(admin, "PATCH", `/employees/${ids[1]}/hourly-rate`, { rate: "0.00", version: 1, reason: "Проверка ставки" })).json().code).toBe("INVALID_RATE");
+    expect((await call(admin, "PATCH", `/employees/${ids[1]}`, body)).statusCode).toBe(200);
+    expect((await call(a, "GET", `/shifts/${id}`)).json().rate).toBe("21.00");
+    expect((await call(a, "GET", "/notifications")).json().find((n: any) => n.title === "Ваша ставка изменена").body).toContain("пересчитаны");
+  });
+  it("does not send an admin their own adjustment notice and records shift context in audit", async () => {
+    const id = await shift();
+    expect((await call(admin, "POST", `/shifts/${id}/adjustments`, { minutes: 10, amount: "0", reason: "Дополнительная работа" })).statusCode).toBe(200);
+    expect((await call(admin, "GET", "/notifications")).json().some((n: any) => n.title === "Корректировка начислений")).toBe(false);
+    const log = (await db.query("SELECT after_value FROM audit_logs WHERE entity_id=$1 AND action='Смена создана'", [id]))[0];
+    expect(log.after_value).toMatchObject({ user_name: "Анна", type_name: "Закрытие", start_time: "20:00", end_time: "22:00", date: day });
+  });
+});
 describe("Server permissions and privacy", () => {
   it("serves all administrative read models", async () => {
     for (const path of [
@@ -277,10 +383,10 @@ describe("Archiving employees and shift types", () => {
     expect((await db.query("SELECT id FROM audit_logs WHERE entity_id=$1 AND action='Смена завершена досрочно при удалении сотрудника'", [current]))).toHaveLength(1);
     const pay = (await call(admin, "GET", `/payroll?from=${day}&to=${day}&user_id=${ids[1]}`)).json()[0];
     expect(pay).toMatchObject({ minutes: 157, amount: "36.63", planned_minutes: 0 });
-    expect((await db.query("SELECT status FROM exchange_listings WHERE id=$1", [listing]))[0].status).toBe("cancelled");
+    expect((await db.query("SELECT status FROM exchange_listings WHERE id=$1", [listing]))[0].status).toBe("closed");
     for (const client of [admin, b]) {
       const schedule = (await call(client, "GET", `/schedule?from=${day}&to=${day}`)).json();
-      expect(schedule.map((shift: any) => shift.id)).toEqual([current, unaffected]);
+      expect(schedule.map((shift: any) => shift.id)).toEqual([current, future, unaffected]);
       expect((await call(client, "GET", "/exchange")).json().some((entry: any) => entry.id === listing)).toBe(false);
     }
   });
@@ -294,7 +400,7 @@ describe("Archiving employees and shift types", () => {
     expect((await call(a, "GET", "/shift-types")).json()).toEqual([]);
     expect((await call(admin, "GET", "/shift-types")).json()[0].active).toBe(false);
     expect((await call(a, "GET", `/shifts/${id}`)).json()).toMatchObject({ amount: original.amount, rate: original.rate, user_id: original.user_id, type_name: "Закрытие" });
-    expect((await db.query("SELECT status FROM exchange_listings WHERE id=$1", [listing]))[0].status).toBe("cancelled");
+    expect((await db.query("SELECT status FROM exchange_listings WHERE id=$1", [listing]))[0].status).toBe("closed");
     expect((await call(admin, "PATCH", `/shift-types/${typeId}`, body)).statusCode).toBe(409);
     const attempt = await call(admin, "POST", "/shifts", { date: day, start_time: "08:00", end_time: "10:00", type_id: typeId, user_id: ids[2] });
     expect(attempt.json().code).toBe("INACTIVE_TYPE");
@@ -359,8 +465,8 @@ describe("Account credentials and shared avatars", () => {
     expect(metadata).toMatchObject({ width: 256, height: 256, format: "webp" });
     expect((await db.query("SELECT avatar_url FROM users WHERE id=$1", [ids[2]]))[0].avatar_url).toBeNull();
     expect((await call(b, "GET", "/team")).json().find((u: any) => u.id === ids[1]).avatar_url).toBe(avatar);
-    expect((await call(b, "GET", `/schedule?from=${day}&to=${day}`)).json()[0].user_avatar_url).toBe(avatar);
-    expect((await call(a, "GET", `/shifts/${id}`)).json().user_avatar_url).toBe(avatar);
+    expect((await call(b, "GET", `/schedule?from=${day}&to=${day}`)).json()[0]).not.toHaveProperty("user_avatar_url");
+    expect((await call(a, "GET", `/shifts/${id}`)).json()).not.toHaveProperty("user_avatar_url");
     const logs = JSON.stringify(await db.query("SELECT before_value,after_value FROM audit_logs"));
     expect(logs).not.toContain(avatar);
     expect((await call(a, "PUT", "/me/avatar", { image: null })).json().avatar_url).toBeNull();
@@ -446,7 +552,7 @@ describe("Personal adjustments and exchange notifications", () => {
   it("keeps a future personal bonus with its beneficiary and blocks every owner-transfer path", async () => {
     const id = await shift(), listing = await list(id), before = await quote(listing);
     expect((await call(admin, "POST", `/shifts/${id}/adjustments`, { minutes: 0, amount: "50.00", reason: "Премия Анне" })).statusCode).toBe(200);
-    expect((await db.query("SELECT status FROM exchange_listings WHERE id=$1", [listing]))[0].status).toBe("cancelled");
+    expect((await db.query("SELECT status FROM exchange_listings WHERE id=$1", [listing]))[0].status).toBe("closed");
     expect((await call(a, "POST", `/shifts/${id}/exchange`)).json().code).toBe("ADJUSTED_OWNER");
     expect((await call(b, "POST", `/exchange/${listing}/take`, { version: before.version }, uid())).statusCode).toBe(409);
     const saved = (await call(admin, "GET", `/shifts/${id}`)).json();
@@ -801,7 +907,7 @@ describe("Atomic exchange", () => {
       { version: q.version },
       uid(),
     );
-    expect(late.json().code).toBe("EXCHANGE_DEADLINE_PASSED");
+    expect(late.json().code).toBe("LISTING_CLOSED");
     const early = await shift(ids[3], {
       start_time: "11:00",
       end_time: "13:00",
@@ -883,7 +989,7 @@ describe("Atomic exchange", () => {
       (
         await db.query("SELECT status FROM exchange_listings WHERE id=$1", [l])
       )[0].status,
-    ).toBe("cancelled");
+    ).toBe("closed");
     expect((await call(a, "GET", `/shifts/${id}`)).json().rate).toBe("14.00");
   });
 });
@@ -940,7 +1046,7 @@ describe("Individual hourly rates", () => {
           listing,
         ])
       )[0].status,
-    ).toBe("cancelled");
+    ).toBe("closed");
     const created = await shift(ids[1], { date: offset(3) });
     expect((await call(a, "GET", `/shifts/${created}`)).json().amount).toBe(
       "45.00",

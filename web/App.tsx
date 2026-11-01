@@ -75,6 +75,7 @@ import {
   hours,
   stamp,
   initials,
+  plural,
 } from "./dates";
 import { Schedule } from "./Schedule";
 import { CoffeeArt } from "./CoffeeArt";
@@ -119,6 +120,7 @@ type Modal =
   | { kind: "reason"; title: string; action: (reason: string) => Promise<any> }
   | { kind: "adjust"; shift: Shift }
   | { kind: "message" }
+  | { kind: "publish"; shift: Shift }
   | { kind: "detail"; shift: Shift };
 const titles: Record<View, string> = {
   home: "Обзор",
@@ -162,7 +164,7 @@ export function App() {
     [loading, setLoading] = useState(false),
     [error, setError] = useState(""),
     [toast, setToast] = useState(""),
-    [modal, setModal] = useState<Modal | null>(null),
+    [modal, updateModal] = useState<Modal | null>(null),
     [busy, setBusy] = useState(false),
     [employees, setEmployees] = useState<User[]>([]),
     [employeeArchive, setEmployeeArchive] = useState(false),
@@ -178,11 +180,16 @@ export function App() {
     activeUser = useRef<string | null>(null);
   const today = minskDate(now),
     isAdmin = user?.role === "admin";
+  function setModal(value: Modal | null) {
+    setError("");
+    updateModal(value);
+  }
   function serverClock(iso: string) {
     timeBase.current = { server: Date.parse(iso), local: performance.now() };
     setNow(new Date(iso));
   }
   function navigate(v: View) {
+    if (v === "home") setAnchor(minskDate(now));
     setView(v);
     setMenu(false);
     window.location.hash = v;
@@ -273,7 +280,9 @@ export function App() {
     const id = user.id,
       seq = ++requestSeq.current;
     setLoading(true);
-    const [from, to] = monthGridRange(anchor),
+    const [from, gridTo] = monthGridRange(anchor),
+      tomorrow = addDays(minskDate(now), 1),
+      to = anchor.slice(0, 7) === minskDate(now).slice(0, 7) && tomorrow > gridTo ? tomorrow : gridTo,
       range = `from=${from}&to=${to}`;
     try {
       const [shifts, mine, team, types, listings, notices, payroll, me] =
@@ -441,6 +450,13 @@ export function App() {
     setPrefs(null);
     setConfig(null);
     setModal(null);
+    setView("home");
+    window.history.replaceState(null, "", window.location.pathname + window.location.search + "#home");
+    setAnchor(minskDate());
+    setMenu(false);
+    setToast("");
+    setEmployeeArchive(false);
+    setTypeArchive(false);
     setCsrf("");
     sessionStorage.removeItem("rcs-user");
     await cacheClear().catch(() => {});
@@ -489,6 +505,7 @@ export function App() {
   }
   async function openQuote(l: Listing) {
     setBusy(true);
+    setError("");
     try {
       const q = await api(`/exchange/${l.id}/quote`);
       setModal({
@@ -509,6 +526,8 @@ export function App() {
   const todayShifts = data.shifts.filter(
       (s) => s.date === today && s.status !== "cancelled",
     ),
+    tomorrowShifts = data.mine.filter((s) => s.date === addDays(today, 1) && s.status !== "cancelled"),
+    monthShiftCount = (isAdmin ? data.shifts : data.mine).filter((s) => s.date.startsWith(anchor.slice(0, 7)) && s.status !== "cancelled").length,
     monthPayroll = data.payroll.filter((p) =>
       p.date.startsWith(anchor.slice(0, 7)),
     ),
@@ -536,6 +555,10 @@ export function App() {
           setCsrf(result.csrf);
           serverClock(result.server_now);
           setAnchor(minskDate(result.server_now));
+          setView("home");
+          setMenu(false);
+          window.location.hash = "home";
+          setError("");
           sessionStorage.setItem("rcs-user", JSON.stringify(result.user));
         }}
       />
@@ -860,7 +883,7 @@ export function App() {
                               setModal({ kind: "detail", shift: s })
                             }
                           >
-                            <Avatar name={s.user_name ?? "Не назначен"} src={s.user_avatar_url} />
+                            <Avatar name={s.user_name ?? "?"} src={data.team.find((person) => person.id === s.user_id)?.avatar_url} />
                             <span>
                               <strong>{s.user_name ?? "Не назначен"}</strong>
                               <small>{s.type_name}</small>
@@ -890,18 +913,16 @@ export function App() {
                     </section>
                   </div>
                   <div className="stats-grid">
+                    {!isAdmin && <>
+                      <Stat title="Завтра" value={String(tomorrowShifts.length)} suffix={plural(tomorrowShifts.length, "смена", "смены", "смен")} icon={CalendarDays} footer={tomorrowShifts.map((s) => `${s.start_time}–${s.end_time}`).join(", ") || "Выходной"} onClick={() => { setAnchor(addDays(today, 1)); navigate("schedule"); }} />
+                      <Stat title="Заработано сегодня" value={currency(data.payroll.filter((p) => p.date === today).reduce((sum, p) => sum + Number(p.amount), 0)).replace(" Br", "")} suffix="Br" icon={Wallet} footer="По завершённым сменам" onClick={() => navigate("payroll")} />
+                    </>}
                     <Stat
                       title={
                         isAdmin ? "Смен в этом месяце" : "Мои смены в месяце"
                       }
-                      value={String(
-                        (isAdmin ? data.shifts : data.mine).filter(
-                          (s) =>
-                            s.date.startsWith(anchor.slice(0, 7)) &&
-                            s.status !== "cancelled",
-                        ).length,
-                      )}
-                      suffix="смен"
+                      value={String(monthShiftCount)}
+                      suffix={plural(monthShiftCount, "смена", "смены", "смен")}
                       icon={CalendarDays}
                       footer={label(anchor, { month: "long", year: "numeric" })}
                     />
@@ -922,7 +943,7 @@ export function App() {
                     <Stat
                       title="Открыто на бирже"
                       value={String(data.listings.length)}
-                      suffix="смен"
+                      suffix={plural(data.listings.length, "смена", "смены", "смен")}
                       icon={ArrowLeftRight}
                       footer="Можно забрать без согласования"
                       accent
@@ -1301,6 +1322,10 @@ export function App() {
                       Внутренний информационный расчёт. Перерывы не вычитаются.
                     </p>
                   </div>
+                  {monthPayroll.length > 0 && <>
+                    {isAdmin && <PayrollTotals title="Итоги по сотрудникам" rows={monthPayroll} group="employee" />}
+                    <PayrollTotals title="Итоги по неделям" rows={monthPayroll} group="week" />
+                  </>}
                   <section className="panel">
                     <div className="section-title padded">
                       <h2>Начисления по дням</h2>
@@ -1395,7 +1420,11 @@ export function App() {
                     <button
                       className={`notice ${!n.read_at ? "new" : ""}`}
                       key={n.id}
-                      onClick={() => {
+                      onClick={async () => {
+                        try {
+                          await api(`/notifications/${n.id}/read`, "POST");
+                          setData((current) => ({ ...current, notices: current.notices.map((notice) => notice.id === n.id ? { ...notice, read_at: now.toISOString() } : notice) }));
+                        } catch (e: any) { setError(e.message); return; }
                         if (n.link.startsWith("shift:")) {
                           api<Shift>("/shifts/" + n.link.slice(6))
                             .then((s) => setModal({ kind: "detail", shift: s }))
@@ -1448,7 +1477,7 @@ export function App() {
                           <tr key={a.id}>
                             <td className="nowrap">{stamp(a.created_at)}</td>
                             <td>{a.actor_name ?? "Система"}</td>
-                            <td>{a.action}</td>
+                            <td>{a.action}{a.entity === "shift" && a.after_value && typeof a.after_value === "object" && "type_name" in a.after_value ? <small className="audit-detail">{String((a.after_value as any).date)} · {String((a.after_value as any).start_time)}–{String((a.after_value as any).end_time)} · {String((a.after_value as any).type_name)} · {String((a.after_value as any).user_name)}</small> : null}</td>
                             <td className="muted">{a.reason ?? "—"}</td>
                           </tr>
                         ))}
@@ -1653,6 +1682,7 @@ const listingLabels: Record<string, string> = {
   open: "Открыта",
   taken: "Передана",
   cancelled: "Отозвана",
+  closed: "Закрыта автоматически",
   expired: "Срок истёк",
   rolled_back: "Откат админом",
 };
@@ -1673,16 +1703,6 @@ function greeting(now: Date) {
     }).format(now),
   );
   return h < 12 ? "Доброе утро" : h < 18 ? "Добрый день" : "Добрый вечер";
-}
-function plural(n: number, one: string, few: string, many: string) {
-  const mod = n % 100;
-  return mod >= 11 && mod <= 14
-    ? many
-    : n % 10 === 1
-      ? one
-      : n % 10 >= 2 && n % 10 <= 4
-        ? few
-        : many;
 }
 export function Brand() {
   return (
@@ -1813,6 +1833,19 @@ export function Form({
     </form>
   );
 }
+function PayrollTotals({ title, rows, group }: { title: string; rows: PayrollRow[]; group: "employee" | "week" }) {
+  const totals = new Map<string, { name: string; minutes: number; amount: number; plannedMinutes: number; plannedAmount: number }>();
+  for (const row of rows) {
+    const key = group === "employee" ? row.user_id : weekStart(row.date);
+    const current = totals.get(key) ?? { name: group === "employee" ? row.name : `${label(key)} – ${label(addDays(key, 6))}`, minutes: 0, amount: 0, plannedMinutes: 0, plannedAmount: 0 };
+    current.minutes += row.minutes;
+    current.amount += Number(row.amount);
+    current.plannedMinutes += row.planned_minutes;
+    current.plannedAmount += Number(row.planned_amount);
+    totals.set(key, current);
+  }
+  return <section className="panel payroll-totals"><div className="section-title padded"><h2>{title}</h2>{group === "week" && <span className="muted small">В пределах выбранного месяца</span>}</div><div className="table-scroll"><table><thead><tr><th>{group === "employee" ? "Сотрудник" : "Неделя"}</th><th>Отработано</th><th>Начислено</th><th>План, ч</th><th>Ожидается</th></tr></thead><tbody>{[...totals.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([key, total]) => <tr key={key}><td>{total.name}</td><td>{hours(total.minutes)} ч</td><td><strong>{currency(total.amount)}</strong></td><td>{hours(total.plannedMinutes)}</td><td>{currency(total.plannedAmount)}</td></tr>)}</tbody></table></div></section>;
+}
 function MonthPager({
   anchor,
   setAnchor,
@@ -1885,7 +1918,7 @@ function Login({ onLogin }: { onLogin: (r: any) => void }) {
         <div>
           <span className="hero-kicker">COFFEE. PEOPLE. SCHEDULE.</span>
           <h1>
-            Хороший кофе.
+            Хороший кофе.{" "}
             <br />
             Свои люди.
             <br />
@@ -2135,13 +2168,13 @@ function ModalDialog({
         </Field>
         <Field
           label="Ставка вручную, Br"
-          hint="Пустое поле — индивидуальная ставка сотрудника или ставка типа."
+          hint={`Сумма ${data.types.find((t) => t.id === selectedType)?.pay_type === "shift" ? "за всю смену" : "за час"}. При ручном вводе используется модель выбранного типа. Пустое поле — оплата по правилам сотрудника или типа.`}
         >
           <input
             name="rate_override"
             inputMode="decimal"
             type="number"
-            min="0"
+            min={data.types.find((type) => type.id === selectedType)?.pay_type === "shift" ? "0" : "0.01"}
             step="0.01"
             placeholder="Автоматически"
           />
@@ -2233,7 +2266,7 @@ function ModalDialog({
           rate: modal.type.rate, allow_exchange: modal.type.allow_exchange,
           active: false, version: modal.type.version,
         }),
-        isEmployee ? "Сотрудник удалён из команды. Смены убраны из графика" : "Тип смены удалён",
+        isEmployee ? "Сотрудник удалён из команды. Будущие смены отменены" : "Тип смены удалён",
       )}>
         <p><strong>{item.name}</strong> будет перемещён в архив.</p>
         <p className="muted small">{isEmployee
@@ -2274,12 +2307,12 @@ function ModalDialog({
         </div>
         <Field
           label="Ставка в час, Br"
-          hint="Например: 12,50 Br за час. У каждого бариста может быть своя сумма."
+          hint="Ставка должна быть больше нуля. Например: 12,50 Br за час."
         >
           <input
             name="rate"
             type="number"
-            min="0"
+            min="0.01"
             step="0.01"
             inputMode="decimal"
             defaultValue={
@@ -2292,12 +2325,12 @@ function ModalDialog({
         </Field>
         <label className="checkbox-field">
           <input type="checkbox" name="apply_to_future" defaultChecked />
-          Пересчитать будущие почасовые смены
+          Пересчитать будущие смены по ставке сотрудника
         </label>
         <p className="muted small">
           Применяется к новым сменам. При выбранном пересчёте обновятся также
-          ещё не начавшиеся почасовые смены; их открытые объявления будут
-          закрыты. Прошедшие смены, фиксированная оплата и ставки, заданные
+          ещё не начавшиеся смены по ставке сотрудника; их открытые объявления будут
+          закрыты. Прошедшие смены, фиксированные типы и ставки, заданные
           вручную в смене, сохраняются.
         </p>
         <Field label="Причина изменения">
@@ -2335,6 +2368,7 @@ function ModalDialog({
                   phone: b.phone,
                   rate: b.rate || null,
                   pay_type: b.pay_type,
+                  ...(e ? { apply_to_future: b.apply_to_future === "on" } : {}),
                   ...(e
                     ? {
                         active: b.active === "on",
@@ -2346,7 +2380,7 @@ function ModalDialog({
                     : { password: b.password, role: b.role, ...(b.current_password ? { current_password: b.current_password } : {}) }),
                 },
               ),
-            "Профиль сохранён",
+            e ? "Профиль сохранён" : "Сотрудник добавлен",
           )
         }
       >
@@ -2393,7 +2427,7 @@ function ModalDialog({
             <input
               name="rate"
               type="number"
-              min="0"
+              min="0.01"
               step=".01"
               defaultValue={e?.rate ?? ""}
               placeholder="Укажите ставку сотрудника"
@@ -2408,6 +2442,8 @@ function ModalDialog({
         </div>
         {e && (
           <>
+            <label className="checkbox-field"><input type="checkbox" name="apply_to_future" defaultChecked />Пересчитать будущие смены по ставке сотрудника</label>
+            <p className="muted small">При изменении ставки или модели оплаты пересчитываются будущие смены по ставке сотрудника. Прошлые смены, фиксированные типы и ручные ставки сохраняются.</p>
             <label className="checkbox-field">
               <input type="checkbox" name="active" defaultChecked={e.active} />
               Сотрудник активен
@@ -2710,6 +2746,10 @@ function ModalDialog({
       </Form>
     );
   }
+  if (modal.kind === "publish") {
+    title = "Выставить смену на биржу?";
+    body = <><p>{label(modal.shift.date)} · {modal.shift.start_time}–{modal.shift.end_time} · {modal.shift.type_name}</p><p className="muted">Объявление станет доступно команде, сотрудники получат уведомления. Пока смену не забрали, она остаётся в вашем графике.</p><div className="modal-footer"><button className="btn" disabled={busy} onClick={close}>Отмена</button><button className="btn primary" disabled={busy || offline} onClick={() => act(() => api(`/shifts/${modal.shift.id}/exchange`, "POST"), "Смена выставлена на биржу")}>{busy ? "Публикуем…" : "Подтвердить публикацию"}</button></div></>;
+  }
   if (modal.kind === "detail") {
     const raw = modal.shift,
       s =
@@ -2731,7 +2771,7 @@ function ModalDialog({
       <>
         <div className="section-title">
           <span className={`tag ${s.exchange_id ? "red" : "neutral"}`}>
-            {s.exchange_id ? "На бирже" : statusLabels[s.status]}
+            {s.status === "cancelled" ? "Отменена" : !s.user_id ? "Не назначена" : s.exchange_id ? "На бирже" : statusLabels[s.status]}
           </span>
           <span className="muted">Минск · UTC+3</span>
         </div>
@@ -2742,7 +2782,7 @@ function ModalDialog({
         </div>
         <h3>{s.type_name}</h3>
         <div className="detail-person">
-          <Avatar name={s.user_name ?? "Не назначен"} src={s.user_avatar_url} />
+          <Avatar name={s.user_name ?? "?"} src={data.team.find((person) => person.id === s.user_id)?.avatar_url} />
           <div>
             <strong>{s.user_name ?? "Не назначен"}</strong>
           </div>
@@ -2774,7 +2814,7 @@ function ModalDialog({
         )}
         {(mine || admin) && new Date(s.closes_at) <= now && (
           <p className="muted small">
-            Биржа закрыта: наступило начало смены или 19:00 её дня.
+            Срок передачи истёк. Биржа работает с 10:00 до 19:00 по Минску.
           </p>
         )}
         {adjustments.length > 0 && (
@@ -2801,12 +2841,7 @@ function ModalDialog({
             <button
               className="btn primary full"
               disabled={busy || offline}
-              onClick={() =>
-                act(
-                  () => api(`/shifts/${s.id}/exchange`, "POST"),
-                  "Смена выставлена на биржу",
-                )
-              }
+              onClick={() => setModal({ kind: "publish", shift: s })}
             >
               <ArrowLeftRight size={17} />
               Выставить на биржу
