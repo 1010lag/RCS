@@ -6,7 +6,7 @@ async function login(page: Page, i = 0) {
   await page.getByLabel("Телефон", { exact: true }).fill(`+37529000000${i}`);
   await page.getByLabel("Пароль", { exact: true }).fill("BrowserTests!2026");
   await page.getByRole("button", { name: "Войти в RCS" }).click();
-  await expect(page.getByRole("heading", { name: /Добро/ })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /Добр/ })).toBeVisible();
   await expect(page.getByText("Синхронизировано")).toBeVisible();
 }
 test("desktop: dashboard, create shift, types, team, payroll, audit and profile", async ({
@@ -414,6 +414,7 @@ test("Android portrait at 9:16 keeps app controls within the phone screen", asyn
       PluginHeaders: [
         { name: "SystemBars", methods: [{ name: "setStyle", rtype: "promise" }] },
         { name: "App", methods: [{ name: "addListener", rtype: "callback" }, { name: "removeListener", rtype: "promise" }] },
+        { name: "PushNotifications", methods: [{ name: "addListener", rtype: "callback" }, { name: "removeListener", rtype: "promise" }] },
         {
           name: "CapacitorHttp",
           methods: [
@@ -447,7 +448,7 @@ test("Android portrait at 9:16 keeps app controls within the phone screen", asyn
     };
   });
   await page.goto("/");
-  await expect(page.getByRole("heading", { name: /Добро/ })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /Добр/ })).toBeVisible();
   await expect(page.getByText("Синхронизировано")).toBeVisible();
   await expect(page.locator("html")).toHaveClass(/native-app/);
   await page.evaluate(() => {
@@ -618,13 +619,83 @@ test("month calendar has continuous readable weeks, boundary shifts and fits a p
   await expect(page.getByRole("button", { name: "День", exact: true })).toHaveClass("active");
 });
 
+test("mobile admin assigns several employees by type and resolves a group conflict without partial saves", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.context().addCookies([{ name: "rcs_session", value: "admin-ui-test-session", url: "http://127.0.0.1:3181", httpOnly: true, sameSite: "Strict" }]);
+  const headers = { "X-CSRF-Token": "admin-ui-test-csrf" };
+  const created = await page.request.post("/api/shift-types", { headers, data: { name: "Закрытие для группы", start_time: "15:00", end_time: "22:00", pay_type: "hourly" } });
+  expect(created.ok()).toBe(true);
+  const closing = (await created.json()).id, types = await (await page.request.get("/api/shift-types")).json();
+  const opening = types.find((type: any) => type.name === "Открытие").id;
+  const me = await (await page.request.get("/api/auth/me")).json();
+  const date = new Date(Date.parse(me.server_now.slice(0, 10)) + 9 * 86400000).toISOString().slice(0, 10);
+  await page.goto("/#schedule");
+  await page.getByRole("button", { name: "Добавить смену", exact: true }).click();
+  const dialog = page.getByRole("dialog"), rows = dialog.getByTestId("assignment-row");
+  await dialog.getByLabel("Дата", { exact: true }).fill(date);
+  await rows.nth(0).getByLabel("Сотрудник", { exact: true }).selectOption({ label: "Анна Смирнова" });
+  await rows.nth(0).getByLabel("Тип смены", { exact: true }).selectOption(opening);
+  await dialog.getByRole("button", { name: "Добавить ещё сотрудника", exact: true }).click();
+  await rows.nth(1).getByLabel("Сотрудник", { exact: true }).selectOption({ label: "Максим Ковалёв" });
+  await rows.nth(1).getByLabel("Тип смены", { exact: true }).selectOption(closing);
+  await expect(rows.nth(1).locator(".assignment-time")).toContainText("15:00–22:00");
+  await expect(dialog.locator('input[type="time"]')).toHaveCount(0);
+  await dialog.getByRole("button", { name: "Добавить ещё сотрудника", exact: true }).click();
+  await dialog.getByRole("button", { name: "Убрать назначение 3", exact: true }).click();
+  await expect(rows).toHaveCount(2);
+  await page.screenshot({ path: ".data/qa/batch-shifts-mobile.png", fullPage: false });
+  await dialog.getByRole("button", { name: "Назначить смены · 2", exact: true }).click();
+  await expect(page.getByRole("status")).toContainText("Смены назначены");
+  await expect(page.locator(".calendar-controls > strong")).toContainText(new Intl.DateTimeFormat("ru-RU", { timeZone: "UTC", day: "numeric", month: "long" }).format(new Date(date)));
+  const schedule = async () => (await (await page.request.get(`/api/schedule?from=${date}&to=${date}`)).json());
+  expect(await schedule()).toHaveLength(2);
+  await page.getByRole("button", { name: "Добавить смену", exact: true }).click();
+  await dialog.getByLabel("Дата", { exact: true }).fill(date);
+  await rows.nth(0).getByLabel("Сотрудник", { exact: true }).selectOption({ label: "Максим Ковалёв" });
+  await rows.nth(0).getByLabel("Тип смены", { exact: true }).selectOption(opening);
+  await dialog.getByRole("button", { name: "Добавить ещё сотрудника", exact: true }).click();
+  await rows.nth(1).getByLabel("Сотрудник", { exact: true }).selectOption({ label: "Анна Смирнова" });
+  await rows.nth(1).getByLabel("Тип смены", { exact: true }).selectOption(opening);
+  await dialog.getByRole("button", { name: "Назначить смены · 2", exact: true }).click();
+  await expect(dialog.getByRole("alert")).toContainText("Вся группа не сохранена");
+  expect(await schedule()).toHaveLength(2);
+  await expect(rows).toHaveCount(2);
+  await rows.nth(1).getByLabel("Тип смены", { exact: true }).selectOption(closing);
+  await dialog.getByRole("button", { name: "Назначить смены · 2", exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  expect(await schedule()).toHaveLength(4);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+});
+
+test("exchange allows quote previews outside 10–19 but disables taking", async ({ page }) => {
+  await page.context().addCookies([{ name: "rcs_session", value: "admin-ui-test-session", url: "http://127.0.0.1:3181", httpOnly: true, sameSite: "Strict" }]);
+  const headers = { "X-CSRF-Token": "admin-ui-test-csrf" }, team = await (await page.request.get("/api/team")).json(), types = await (await page.request.get("/api/shift-types")).json();
+  const serverNow = (await (await page.request.get("/api/auth/me")).json()).server_now;
+  const date = new Date(Date.parse(serverNow.slice(0, 10)) + 10 * 86400000).toISOString().slice(0, 10);
+  const made = await page.request.post("/api/shifts", { headers, data: { date, start_time: "08:00", end_time: "15:00", type_id: types.find((type: any) => type.name === "Открытие").id, user_id: team.find((person: any) => person.name === "Анна Смирнова").id } });
+  expect(made.ok()).toBe(true);
+  const listed = await page.request.post(`/api/shifts/${(await made.json()).id}/exchange`, { headers });
+  expect(listed.ok()).toBe(true);
+  const listingId = (await listed.json()).id;
+  const loginResponse = await page.request.post("/api/auth/login", { data: { phone: "+375290000002", password: "BrowserTests!2026" } });
+  expect(loginResponse.ok()).toBe(true);
+  await page.route("**/api/auth/me", async (route) => {
+    const response = await route.fetch(), data = await response.json();
+    await route.fulfill({ response, json: { ...data, server_now: `${data.server_now.slice(0, 10)}T09:00:00+03:00` } });
+  });
+  await page.goto("/#exchange");
+  await expect(page.locator(".info-strip").first()).toContainText("с 10:00 до 19:00");
+  await page.locator(`[data-listing-id="${listingId}"]`).getByRole("button", { name: "Посмотреть условия", exact: true }).click();
+  await expect(page.getByRole("dialog").getByRole("button", { name: "Подтвердить и забрать", exact: true })).toBeDisabled();
+});
+
 test("admin edits employee login data and their own phone and password", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.context().addCookies([{
-    name: "rcs_session", value: "admin-ui-test-session",
+    name: "rcs_session", value: "credential-ui-test-session",
     url: "http://127.0.0.1:3181", httpOnly: true, sameSite: "Strict",
   }]);
-  const response = await page.request.post("/api/employees", { headers: { "X-CSRF-Token": "admin-ui-test-csrf" }, data: {
+  const response = await page.request.post("/api/employees", { headers: { "X-CSRF-Token": "credential-csrf" }, data: {
     name: "Сброс доступа", phone: "+375299999992", role: "barista", rate: "10.00", pay_type: "hourly", password: "InitialFixture!2026",
   } });
   expect(response.ok()).toBe(true);

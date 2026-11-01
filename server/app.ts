@@ -8,9 +8,11 @@ import { prepareAvatar } from "./avatar";
 import { budgetKey, consumeBudget, MemoryBudget, ResourceGate, trustedProxies } from "./security";
 import { StreamHub } from "./streams";
 import { payrollRows } from "./payroll";
+import { notificationText } from "./notification-text";
 import type { Database, Sql } from "./db";
 import type { User } from "../shared/types";
-import { firebasePush, invalidPushToken, type PushGateway } from "./push";
+import { canTakeExchangeAt } from "../shared/exchange-window";
+import { firebasePush, invalidPushToken, platformPushReady, type PushGateway } from "./push";
 import {
   Problem,
   fail,
@@ -310,7 +312,9 @@ export async function createApp(
       server_now: (await time(db)).toISOString(),
       push_config: settings.ready ? settings.config : null,
       vapid_key: settings.ready ? settings.vapidKey : null,
-      push_ready: settings.ready,
+      push_ready: platformPushReady(settings, "web"),
+      push_android_ready: platformPushReady(settings, "android"),
+      push_project_id: settings.projectId ?? settings.config?.projectId ?? null,
     };
   });
   route("POST", "/auth/logout", async (req, reply) => {
@@ -423,14 +427,6 @@ export async function createApp(
           null,
           publicUser(u),
         );
-        await notify(
-          sql,
-          await admins(sql),
-          "Новый сотрудник",
-          `${b.name} добавлен в команду`,
-          "admin",
-          "employees",
-        );
         return publicUser(u);
       });
     },
@@ -532,14 +528,6 @@ export async function createApp(
           publicUser(old),
           publicUser(u),
           b.reason,
-        );
-        await notify(
-          sql,
-          await admins(sql),
-          "Команда обновлена",
-          `${b.name}: данные сотрудника изменены`,
-          "admin",
-          "employees",
         );
         return publicUser(u);
       });
@@ -678,14 +666,6 @@ export async function createApp(
         id,
         old,
         b,
-      );
-      await notify(
-        sql,
-        await admins(sql),
-        "Типы смен обновлены",
-        b.name,
-        "admin",
-        "types",
       );
       return { id };
     });
@@ -849,6 +829,49 @@ export async function createApp(
       }),
     true,
   );
+  route("POST", "/shifts/batch", async (req) => {
+    const body = z.object({
+      date: z.string(),
+      assignments: z.array(z.object({ user_id: idSchema.nullable(), type_id: idSchema, type_version: z.number().int().positive() })).min(1).max(50),
+      status: z.enum(["planned", "confirmed"]).default("confirmed"),
+      comment: z.string().max(1000).default(""),
+      exchange_locked: z.boolean().default(false),
+    }).parse(req.body);
+    period(body.date, body.date);
+    const key = z.string().min(10).max(100).parse(req.headers["idempotency-key"]);
+    const requestHash = digest("batch-shifts:" + JSON.stringify(body));
+    return db.tx(async (sql) => {
+      const previous = (await sql.query("SELECT request_hash,response FROM idempotency WHERE user_id=$1 AND key=$2 FOR UPDATE", [req.user.id, key]))[0];
+      if (previous) {
+        if (previous.request_hash !== requestHash) fail("IDEMPOTENCY_MISMATCH", "Данные назначения изменились. Повторите сохранение", 409);
+        return previous.response;
+      }
+      const types = await sql.query("SELECT * FROM shift_types WHERE id=ANY($1::uuid[]) ORDER BY id FOR SHARE", [[...new Set(body.assignments.map((item) => item.type_id))]]);
+      const people = await sql.query("SELECT id,name FROM users WHERE id=ANY($1::uuid[]) ORDER BY id FOR SHARE", [body.assignments.map((item) => item.user_id).filter(Boolean)]);
+      const ids: string[] = [];
+      for (const assignment of body.assignments) {
+        const type = types.find((type) => type.id === assignment.type_id);
+        if (!type?.active) fail("INACTIVE_TYPE", "Один из типов смен недоступен. Ничего не сохранено");
+        expectVersion(type, assignment.type_version);
+        const person = people.find((person) => person.id === assignment.user_id)?.name ?? "Неназначенная смена";
+        try {
+          const created = await writeShift(sql, req.user.id, {
+            date: body.date, type_id: type.id, user_id: assignment.user_id,
+            start_time: type.start_time.slice(0, 5), end_time: type.end_time.slice(0, 5),
+            status: body.status, comment: body.comment, exchange_locked: body.exchange_locked,
+          });
+          ids.push(created.id);
+        } catch (error) {
+          if ((error as any).code === "23P01") fail("BATCH_SHIFT_OVERLAP", `${person}: уже есть смена в это время. Вся группа не сохранена`, 409);
+          if (error instanceof Problem) throw new Problem(error.status, error.code, `${person}: ${error.message}. Вся группа не сохранена`);
+          throw error;
+        }
+      }
+      const response = { ids, count: ids.length };
+      await sql.query("INSERT INTO idempotency(user_id,key,request_hash,response) VALUES($1,$2,$3,$4)", [req.user.id, key, requestHash, response]);
+      return response;
+    });
+  }, true);
   route(
     "DELETE",
     "/shifts/:id",
@@ -1045,6 +1068,7 @@ export async function createApp(
       if (s.user_id === req.user.id)
         fail("OWN_SHIFT", "Нельзя забрать свою смену", 409);
       const q = await quote(sql, s, req.user.id);
+      if (!canTakeExchangeAt(await time(sql))) fail("EXCHANGE_HOURS", "Забирать смены на бирже можно с 10:00 до 19:00 по Минску", 409);
       if (q.version !== b.version)
         fail(
           "QUOTE_CHANGED",
@@ -1255,11 +1279,11 @@ export async function createApp(
   }
   route("GET", "/me/payroll", (req) => payroll(req, true));
   route("GET", "/payroll", (req) => payroll(req), true);
-  route("GET", "/notifications", (req) =>
-    db.query(
-      "SELECT id,title,body,category,link,read_at,created_at FROM notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 200",
+  route("GET", "/notifications", async (req) =>
+    (await db.query(
+      "SELECT id,title,body,category,link,read_at,created_at FROM notifications WHERE user_id=$1 AND NOT (category='admin' AND link IN ('employees','types') AND title IN ('Новый сотрудник','Команда обновлена','Типы смен обновлены')) ORDER BY created_at DESC LIMIT 200",
       [req.user.id],
-    ),
+    )).map((notice) => ({ ...notice, body: notificationText(notice.body) })),
   );
   route("POST", "/notifications/read", async (req) => {
     await db.query(
@@ -1344,18 +1368,18 @@ export async function createApp(
     return b;
   });
   route("POST", "/me/push-devices", async (req) => {
-    if (!(await push.settings()).ready)
+    const b = z.object({
+      token: z.string().min(20).max(4096),
+      platform: z.enum(["web", "android"]).default("web"),
+      user_id: idSchema.optional(),
+    }).parse(req.body);
+    if (b.user_id && b.user_id !== req.user.id) fail("FORBIDDEN", "Аккаунт изменился. Включите уведомления заново", 403);
+    if (!platformPushReady(await push.settings(), b.platform))
       fail(
         "PUSH_NOT_CONFIGURED",
         "Доставка уведомлений ещё не настроена администратором",
         409,
       );
-    const b = z
-      .object({
-        token: z.string().min(20).max(4096),
-        platform: z.enum(["web", "android"]).default("web"),
-      })
-      .parse(req.body);
     const device = await db.tx(async (sql) => {
       if (!(await sql.query("SELECT id FROM sessions WHERE id=$1 AND user_id=$2 AND expires_at>clock_timestamp() FOR SHARE", [req.session.id, req.user.id])).length)
         fail("UNAUTHORIZED", "Сессия истекла. Войдите снова", 401);
@@ -1373,13 +1397,13 @@ export async function createApp(
     const device = id
       ? (
           await db.query(
-            "SELECT id FROM push_devices WHERE id=$1 AND user_id=$2 AND session_id=$3",
+            "SELECT id,platform FROM push_devices WHERE id=$1 AND user_id=$2 AND session_id=$3",
             [idSchema.parse(id), req.user.id, req.session.id],
           )
         )[0]
       : null;
     return {
-      configured: settings.ready,
+      configured: platformPushReady(settings, device?.platform ?? ((req.query as any).platform === "android" ? "android" : "web")),
       registered: !!device,
       device_id: device?.id ?? null,
     };
@@ -1396,9 +1420,11 @@ export async function createApp(
       )[0];
       return {
         configured: settings.ready,
+        android_configured: platformPushReady(settings, "android"),
+        web_configured: platformPushReady(settings, "web"),
         status: settings.status,
         issues: settings.issues,
-        project_id: settings.config?.projectId ?? null,
+        project_id: settings.projectId ?? settings.config?.projectId ?? null,
         origin: settings.origin,
         ...counts,
       };
@@ -1416,7 +1442,7 @@ export async function createApp(
     )[0];
     if (!device)
       fail("DEVICE_NOT_FOUND", "Сначала включите push на этом устройстве", 404);
-    if (!(await push.settings()).ready)
+    if (!platformPushReady(await push.settings(), device.platform))
       fail(
         "PUSH_NOT_CONFIGURED",
         "Доставка уведомлений ещё не настроена администратором",

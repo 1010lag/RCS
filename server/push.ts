@@ -3,6 +3,7 @@ import { createPrivateKey, ECDH } from "node:crypto";
 import { initializeApp, applicationDefault, getApps } from "firebase-admin/app";
 import { getMessaging } from "firebase-admin/messaging";
 import { z } from "zod";
+import { notificationText } from "./notification-text";
 
 const webConfigSchema = z.object({
   apiKey: z.string().min(10),
@@ -15,6 +16,9 @@ const webConfigSchema = z.object({
 });
 export type PushSettings = {
   ready: boolean;
+  androidReady?: boolean;
+  webReady?: boolean;
+  projectId?: string | null;
   status: "unconfigured" | "incomplete" | "invalid" | "ready";
   issues: string[];
   config: z.infer<typeof webConfigSchema> | null;
@@ -33,78 +37,73 @@ export interface PushGateway {
   settings(): Promise<PushSettings>;
   send(message: PushMessage): Promise<string>;
 }
-export async function inspectPushSettings(
-  env: NodeJS.ProcessEnv = process.env,
-): Promise<PushSettings> {
+export function platformPushReady(settings: PushSettings, platform: "web" | "android" = "web") {
+  return platform === "android" ? settings.androidReady ?? settings.ready : settings.webReady ?? settings.ready;
+}
+export async function inspectPushSettings(env: NodeJS.ProcessEnv = process.env): Promise<PushSettings> {
   const issues: string[] = [];
-  if (!env.FIREBASE_WEB_CONFIG) issues.push("FIREBASE_WEB_CONFIG");
-  if (!env.FIREBASE_VAPID_KEY) issues.push("FIREBASE_VAPID_KEY");
-  if (!env.GOOGLE_APPLICATION_CREDENTIALS && env.FIREBASE_USE_ADC !== "1")
-    issues.push("GOOGLE_APPLICATION_CREDENTIALS");
-  if (!env.APP_ORIGIN) issues.push("APP_ORIGIN");
-  const state: PushSettings = {
-    ready: false,
-    status: issues.length === 4 ? "unconfigured" : "incomplete",
-    issues,
-    config: null,
-    vapidKey: null,
-    origin: null,
-  };
-  if (issues.length) return state;
-  try {
-    state.config = webConfigSchema.parse(JSON.parse(env.FIREBASE_WEB_CONFIG!));
-    const vapid = Buffer.from(env.FIREBASE_VAPID_KEY!, "base64url");
-    if (vapid.length !== 65 || vapid[0] !== 4) throw new Error("VAPID");
-    ECDH.convertKey(vapid, "prime256v1");
-    const origin = new URL(env.APP_ORIGIN!);
-    if (
-      (origin.protocol !== "https:" &&
-        !(
-          ["localhost", "127.0.0.1", "[::1]"].includes(origin.hostname) &&
-          origin.protocol === "http:"
-        )) ||
-      origin.username ||
-      origin.password ||
-      origin.pathname !== "/" ||
-      origin.search ||
-      origin.hash
-    )
-      throw new Error("ORIGIN");
-    if (env.GOOGLE_APPLICATION_CREDENTIALS) {
-      const credential = JSON.parse(
-        await readFile(env.GOOGLE_APPLICATION_CREDENTIALS, "utf8"),
-      );
-      if (
-        credential.type !== "service_account" ||
-        credential.project_id !== state.config.projectId ||
-        typeof credential.client_email !== "string"
-      )
-        throw new Error("CREDENTIAL");
+  let projectId = env.FIREBASE_PROJECT_ID?.trim() || null;
+  let config: PushSettings["config"] = null;
+  let invalid = false;
+  if (env.FIREBASE_WEB_CONFIG) {
+    try { config = webConfigSchema.parse(JSON.parse(env.FIREBASE_WEB_CONFIG)); }
+    catch { invalid = true; issues.push("Неверная Web-конфигурация Firebase"); }
+  } else issues.push("FIREBASE_WEB_CONFIG");
+
+  let credentialsValid = false;
+  if (env.GOOGLE_APPLICATION_CREDENTIALS) {
+    try {
+      const credential = JSON.parse(await readFile(env.GOOGLE_APPLICATION_CREDENTIALS, "utf8"));
+      if (credential.type !== "service_account" || typeof credential.project_id !== "string" || credential.project_id.length < 3 || typeof credential.client_email !== "string") throw new Error("CREDENTIAL");
+      if (projectId && projectId !== credential.project_id) throw new Error("PROJECT");
       createPrivateKey(credential.private_key);
-    }
-    return {
-      ...state,
-      ready: true,
-      status: "ready",
-      vapidKey: env.FIREBASE_VAPID_KEY!,
-      origin: origin.origin,
-    };
-  } catch {
-    return {
-      ...state,
-      config: null,
-      issues: [
-        "Проверьте Web-конфигурацию, публичный VAPID-ключ, адрес приложения и серверные credentials одного Firebase-проекта",
-      ],
-      status: "invalid",
-    };
-  }
+      projectId = credential.project_id;
+      credentialsValid = true;
+    } catch { invalid = true; issues.push("Серверные credentials Firebase недействительны или относятся к другому проекту"); }
+  } else if (env.FIREBASE_USE_ADC === "1") {
+    projectId ??= config?.projectId ?? null;
+    credentialsValid = Boolean(projectId);
+    if (!projectId) issues.push("FIREBASE_PROJECT_ID");
+  } else issues.push("GOOGLE_APPLICATION_CREDENTIALS");
+
+  let vapidKey: string | null = null;
+  if (env.FIREBASE_VAPID_KEY) {
+    try {
+      const vapid = Buffer.from(env.FIREBASE_VAPID_KEY, "base64url");
+      if (vapid.length !== 65 || vapid[0] !== 4) throw new Error("VAPID");
+      ECDH.convertKey(vapid, "prime256v1");
+      vapidKey = env.FIREBASE_VAPID_KEY;
+    } catch { invalid = true; issues.push("Неверный публичный VAPID-ключ"); }
+  } else issues.push("FIREBASE_VAPID_KEY");
+
+  let origin: string | null = null;
+  if (env.APP_ORIGIN) {
+    try {
+      const url = new URL(env.APP_ORIGIN);
+      if ((url.protocol !== "https:" && !(["localhost", "127.0.0.1", "[::1]"].includes(url.hostname) && url.protocol === "http:")) || url.username || url.password || url.pathname !== "/" || url.search || url.hash) throw new Error("ORIGIN");
+      origin = url.origin;
+    } catch { invalid = true; issues.push("Web Push требует HTTPS-адрес приложения"); }
+  } else issues.push("APP_ORIGIN");
+
+  const androidReady = credentialsValid && Boolean(projectId);
+  const webProjectMatches = Boolean(config && config.projectId === projectId);
+  if (config && projectId && !webProjectMatches) { invalid = true; issues.push("Web-приложение и серверный аккаунт относятся к разным Firebase-проектам"); }
+  const webReady = androidReady && webProjectMatches && Boolean(vapidKey && origin);
+  const ready = androidReady || webReady;
+  const empty = !env.FIREBASE_PROJECT_ID && !env.FIREBASE_WEB_CONFIG && !env.FIREBASE_VAPID_KEY && !env.GOOGLE_APPLICATION_CREDENTIALS && env.FIREBASE_USE_ADC !== "1" && !env.APP_ORIGIN;
+  return {
+    ready, androidReady, webReady, projectId,
+    status: ready ? "ready" : invalid ? "invalid" : empty ? "unconfigured" : "incomplete",
+    issues, config: webReady ? config : null,
+    vapidKey: webReady ? vapidKey : null, origin,
+  };
 }
 let cachedKey = "",
   cached: Promise<PushSettings> | null = null;
 export const firebasePush: PushGateway = {
   settings() {
     const key = JSON.stringify([
+      process.env.FIREBASE_PROJECT_ID,
       process.env.FIREBASE_WEB_CONFIG,
       process.env.FIREBASE_VAPID_KEY,
       process.env.GOOGLE_APPLICATION_CREDENTIALS,
@@ -118,8 +117,9 @@ export const firebasePush: PushGateway = {
     return cached;
   },
   async send(message) {
+    const body = notificationText(message.body);
     const settings = await this.settings();
-    if (!settings.ready)
+    if (!platformPushReady(settings, message.platform))
       throw Object.assign(new Error("Push не настроен"), {
         code: "push/not-configured",
       });
@@ -128,21 +128,24 @@ export const firebasePush: PushGateway = {
       initializeApp(
         {
           credential: applicationDefault(),
-          projectId: settings.config!.projectId,
+          projectId: settings.projectId ?? settings.config?.projectId,
         },
         "rcs-push",
       );
     if (message.platform === "android")
       return getMessaging(app).send({
         token: message.token,
-        notification: { title: message.title, body: message.body },
+        notification: { title: message.title, body },
         data: { link: safePushLink(message.link), notification_id: message.id },
         android: {
           priority: "high",
+          ttl: 3600000,
           notification: {
             channelId: "rcs",
             icon: "ic_stat_rcs",
             color: "#E10600",
+            tag: message.id,
+            defaultSound: true,
           },
         },
       });
@@ -151,7 +154,7 @@ export const firebasePush: PushGateway = {
       token: message.token,
       data: {
         title: message.title,
-        body: message.body,
+        body,
         link: safePushLink(message.link),
         notification_id: message.id,
       },

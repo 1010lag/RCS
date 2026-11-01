@@ -80,6 +80,8 @@ import { Schedule } from "./Schedule";
 import { CoffeeArt } from "./CoffeeArt";
 import { ThemeSettings } from "./ThemeSettings";
 import { AvatarSettings } from "./AvatarSettings";
+import { BatchShiftForm } from "./BatchShiftForm";
+import { canTakeExchangeAt } from "../shared/exchange-window";
 import { PushControls } from "./PushControls";
 import { registerPushDevice, clearPushRegistration } from "./push-client";
 import { nativeApp, serverBase } from "./runtime";
@@ -394,7 +396,7 @@ export function App() {
       api("/me/preferences")
         .then(setPrefs)
         .catch((e) => setError(e.message));
-  }, [view, user?.id, data.synced]);
+  }, [view, user?.id, data]);
   useEffect(() => {
     if (!toast) return;
     const timer = setTimeout(() => setToast(""), 4500);
@@ -415,6 +417,18 @@ export function App() {
       void registerPushDevice(config, user.id).catch(() => {});
     }
   }, [user?.id, user?.must_change_password, config?.push_ready, offline]);
+  useEffect(() => {
+    if (!nativeApp || !user || user.must_change_password || offline || !config?.push_android_ready || import.meta.env.VITE_NATIVE_FIREBASE_CONFIGURED !== "true") return;
+    if (import.meta.env.VITE_NATIVE_FIREBASE_PROJECT_ID && import.meta.env.VITE_NATIVE_FIREBASE_PROJECT_ID !== config?.push_project_id) return;
+    const refresh = () => {
+      if (localStorage.getItem("rcs-push-user") !== user.id) return;
+      void import("./native-push").then(({ registerNativePushDevice }) => registerNativePushDevice(user.id)).catch(() => {});
+    };
+    refresh();
+    const visible = () => { if (document.visibilityState === "visible") refresh(); };
+    document.addEventListener("visibilitychange", visible);
+    return () => document.removeEventListener("visibilitychange", visible);
+  }, [user?.id, user?.must_change_password, config?.push_android_ready, config?.push_project_id, offline]);
   async function forget() {
     void clearPushRegistration(config);
     activeUser.current = null;
@@ -991,8 +1005,8 @@ export function App() {
                     <div>
                       <strong>Забирайте смены без ожидания</strong>
                       <span>
-                        Передача доступна до начала смены и до 19:00 по Минску в
-                        её день. Сначала сработает более ранняя граница.
+                        Забрать смену можно ежедневно с 10:00 до 19:00 по Минску,
+                        до её начала. В остальное время можно посмотреть условия.
                       </span>
                     </div>
                   </div>
@@ -1007,7 +1021,7 @@ export function App() {
                   </div>
                   <div className="exchange-grid">
                     {data.listings.map((l) => (
-                      <section className="panel listing-card" key={l.id}>
+                      <section className="panel listing-card" key={l.id} data-listing-id={l.id}>
                         <div className="section-title">
                           <span className="tag red">На бирже</span>
                           <span className="muted">
@@ -1058,7 +1072,7 @@ export function App() {
                             disabled={busy || offline}
                             onClick={() => openQuote(l)}
                           >
-                            Посмотреть и забрать <ArrowUpRight size={16} />
+                            {canTakeExchangeAt(now) ? "Посмотреть и забрать" : "Посмотреть условия"} <ArrowUpRight size={16} />
                           </button>
                         )}
                       </section>
@@ -1617,6 +1631,7 @@ export function App() {
           now={now}
           act={act}
           setModal={setModal}
+          onAssigned={(date) => { setAnchor(date); navigate("schedule"); }}
         />
       )}
     </div>
@@ -1959,6 +1974,7 @@ function ModalDialog({
   now,
   act,
   setModal,
+  onAssigned,
 }: {
   modal: Modal;
   close: () => void;
@@ -1970,6 +1986,7 @@ function ModalDialog({
   now: Date;
   act: (fn: () => Promise<any>, message?: string) => Promise<any>;
   setModal: (m: Modal | null) => void;
+  onAssigned: (date: string) => void;
 }) {
   const ref = useRef<HTMLDialogElement>(null),
     [typePayType, setTypePayType] = useState<"hourly" | "shift">(modal.kind === "type" ? modal.type?.pay_type ?? "hourly" : "hourly"),
@@ -2008,7 +2025,11 @@ function ModalDialog({
   const admin = user.role === "admin";
   let title = "",
     body: ReactNode = null;
-  if (modal.kind === "shift") {
+  if (modal.kind === "shift" && !modal.shift) {
+    title = "Назначить смены";
+    body = <BatchShiftForm date={modal.date ?? minskDate(now)} userId={modal.userId} types={data.types} team={data.team} busy={busy} offline={offline} close={close} act={act} onAssigned={onAssigned} />;
+  }
+  if (modal.kind === "shift" && modal.shift) {
     const s = modal.shift;
     title = s ? "Редактировать смену" : "Новая смена";
     body = (
@@ -2535,13 +2556,14 @@ function ModalDialog({
           Смена сразу появится в вашем графике. Подтверждение администратора не
           требуется. Повторно передать её через биржу будет нельзя.
         </p>
+        {!canTakeExchangeAt(now) && <p className="info-strip">Забор смен доступен с 10:00 до 19:00 по Минску.</p>}
         <div className="modal-footer">
           <button className="btn" onClick={close}>
             Отмена
           </button>
           <button
             className="btn primary"
-            disabled={busy || offline}
+            disabled={busy || offline || !canTakeExchangeAt(now)}
             onClick={() =>
               act(
                 () =>
@@ -2723,7 +2745,6 @@ function ModalDialog({
           <Avatar name={s.user_name ?? "Не назначен"} src={s.user_avatar_url} />
           <div>
             <strong>{s.user_name ?? "Не назначен"}</strong>
-            <p className="muted">Ответственный за смену</p>
           </div>
         </div>
         {s.amount !== undefined && (
@@ -2850,7 +2871,7 @@ function ModalDialog({
   return (
     <dialog
       ref={ref}
-      className="modal"
+      className={`modal ${modal.kind === "shift" && !modal.shift ? "assignment-modal" : ""}`}
       aria-labelledby="modal-title"
       onCancel={(e) => {
         e.preventDefault();

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { notificationText } from "./notification-text";
 import type { Sql } from "./db";
 import type { User, PayType } from "../shared/types";
 export class Problem extends Error {
@@ -122,6 +123,7 @@ export async function notify(
   link = "schedule",
   dedup?: string,
 ) {
+  body = notificationText(body);
   for (const user of new Set(users.filter(Boolean))) {
     const id = uid();
     const result = await sql.query(

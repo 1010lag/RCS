@@ -1627,6 +1627,18 @@ table tbody tr:last-child td {
   grid-template-columns: 1fr 1fr;
   gap: 15px;
 }
+.assignment-modal { width: min(680px, calc(100% - 28px)); }
+.assignment-list { display: grid; gap: 16px; margin: 20px 0 16px; }
+.assignment-row { min-width: 0; position: relative; border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin: 0; }
+.assignment-row legend { padding: 0 6px; font-size: 12px; font-weight: 700; }
+.assignment-row .field { min-width: 0; margin-bottom: 10px; }
+.assignment-row select { min-width: 0; }
+.assignment-remove { position: absolute; right: 9px; top: -17px; background: var(--surface, #fff); color: var(--text-muted, #85858d); }
+.assignment-time { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin: 0; font-size: 13px; font-weight: 700; }
+.assignment-time span { font-size: 11px; font-weight: 400; color: var(--text-muted, #85858d); }
+.assignment-options { margin-top: 20px; }
+.assignment-options summary { cursor: pointer; font-size: 12px; color: var(--text-secondary, #62626d); margin-bottom: 16px; }
+@media (max-width: 560px) { .assignment-row .form-row { grid-template-columns: 1fr; gap: 0; } .assignment-row { padding: 12px; } }
 .checkbox-field {
   display: flex;
   gap: 10px;

@@ -38,7 +38,7 @@ function WebPushControls({ userId, admin, config, offline, report }: Props) {
       "PushManager" in window,
     secure = window.isSecureContext,
     configured = !!config?.push_ready;
-  const enabled = registered && permission === "granted";
+  const enabled = configured && registered && permission === "granted";
   async function status() {
     const id = localStorage.getItem("rcs-push-device");
     const state = await api(
@@ -109,8 +109,8 @@ function WebPushControls({ userId, admin, config, offline, report }: Props) {
   return (
     <section className="push-controls" aria-label="Уведомления на устройстве">
       <div className="push-state">
-        <span className={`tag ${registered ? "neutral" : "red"}`}>
-          {registered && permission === "granted" ? (
+        <span className={`tag ${enabled ? "neutral" : "red"}`}>
+          {enabled ? (
             <>
               <CheckCircle2 size={13} />
               Включены на устройстве
@@ -122,7 +122,7 @@ function WebPushControls({ userId, admin, config, offline, report }: Props) {
       </div>
       {!configured && (
         <p className="muted small">
-          Доставка на телефон ещё не настроена администратором. История
+          Push в этом браузере ещё не настроены. История
           уведомлений в RCS работает.
         </p>
       )}

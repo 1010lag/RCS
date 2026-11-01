@@ -213,6 +213,16 @@ describe("Server permissions and privacy", () => {
   });
 });
 describe("Archiving employees and shift types", () => {
+  it("keeps team and shift-type edits in audit without sending service notifications", async () => {
+    const created = await call(admin, "POST", "/employees", { name: "Новый бариста", phone: "+375299999771", rate: "14.00", password: "EmployeePassword!2026" });
+    expect(created.statusCode).toBe(200);
+    const current = (await db.query("SELECT name,phone,rate::text,pay_type,active,version FROM users WHERE id=$1", [ids[1]]))[0];
+    expect((await call(admin, "PATCH", `/employees/${ids[1]}`, { ...current, name: "Анна Новая", reason: "Изменение фамилии" })).statusCode).toBe(200);
+    expect((await call(admin, "POST", "/shift-types", { name: "Новый тип", start_time: "09:00", end_time: "12:00", pay_type: "hourly" })).statusCode).toBe(200);
+    expect((await call(admin, "PATCH", `/shift-types/${typeId}`, { name: "Вечерняя", start_time: "20:00", end_time: "22:00", pay_type: "hourly", active: true, version: 1 })).statusCode).toBe(200);
+    expect(await db.query("SELECT * FROM notifications")).toHaveLength(0);
+    expect(await db.query("SELECT * FROM audit_logs")).toHaveLength(4);
+  });
   async function archiveEmployee(index: number, client = admin, version = 1) {
     const employee = (await db.query("SELECT name,phone,rate::text,pay_type FROM users WHERE id=$1", [ids[index]]))[0];
     return call(client, "PATCH", `/employees/${ids[index]}`, {
@@ -504,6 +514,53 @@ describe("Personal adjustments and exchange notifications", () => {
 });
 
 describe("Calendar and pay", () => {
+  it("assigns a group using server-side type hours and each employee rate, with idempotent retries", async () => {
+    const morning = (await call(admin, "POST", "/shift-types", { name: "Утро", start_time: "08:00", end_time: "15:00", pay_type: "hourly" })).json().id;
+    const payload = { date: day, assignments: [{ user_id: ids[1], type_id: typeId, type_version: 1, start_time: "00:01" }, { user_id: ids[2], type_id: morning, type_version: 1 }], status: "confirmed" };
+    const key = uid(), response = await call(admin, "POST", "/shifts/batch", payload, key);
+    expect(response.statusCode, response.body).toBe(200);
+    expect(response.json().count).toBe(2);
+    const schedule = (await call(admin, "GET", `/schedule?from=${day}&to=${day}`)).json();
+    expect(schedule.find((item: any) => item.user_id === ids[1])).toMatchObject({ start_time: "20:00", end_time: "22:00", rate: "14.00", amount: "28.00" });
+    expect(schedule.find((item: any) => item.user_id === ids[2])).toMatchObject({ start_time: "08:00", end_time: "15:00", rate: "16.00", amount: "112.00" });
+    expect((await call(admin, "POST", "/shifts/batch", payload, key)).json()).toEqual(response.json());
+    expect(await db.query("SELECT * FROM shifts")).toHaveLength(2);
+    expect(await db.query("SELECT * FROM notifications")).toHaveLength(2);
+    expect((await call(admin, "POST", "/shifts/batch", { ...payload, comment: "Другой запрос" }, key)).json().code).toBe("IDEMPOTENCY_MISMATCH");
+  });
+  it("rolls back the whole group, its audit and notifications when any employee overlaps", async () => {
+    await shift(ids[2]);
+    const notices = (await db.query("SELECT * FROM notifications")).length, audits = (await db.query("SELECT * FROM audit_logs")).length;
+    const response = await call(admin, "POST", "/shifts/batch", { date: day, assignments: [ids[1], ids[2]].map((user_id) => ({ user_id, type_id: typeId, type_version: 1 })) }, uid());
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({ code: "BATCH_SHIFT_OVERLAP" });
+    expect(response.json().message).toContain("Максим");
+    expect(await db.query("SELECT * FROM shifts")).toHaveLength(1);
+    expect(await db.query("SELECT * FROM notifications")).toHaveLength(notices);
+    expect(await db.query("SELECT * FROM audit_logs")).toHaveLength(audits);
+    expect(await db.query("SELECT * FROM idempotency")).toHaveLength(0);
+  });
+  it("rejects stale types, inactive employees, missing keys and oversized groups", async () => {
+    const payload = { date: day, assignments: [{ user_id: ids[1], type_id: typeId, type_version: 1 }] };
+    expect((await call(a, "POST", "/shifts/batch", payload, uid())).statusCode).toBe(403);
+    expect((await call(admin, "POST", "/shifts/batch", payload)).statusCode).toBe(422);
+    expect((await call(admin, "POST", "/shifts/batch", { ...payload, date: "2026-02-30" }, uid())).statusCode).toBe(422);
+    expect((await call(admin, "POST", "/shifts/batch", { ...payload, assignments: Array(51).fill(payload.assignments[0]) }, uid())).statusCode).toBe(422);
+    await db.query("UPDATE shift_types SET version=2 WHERE id=$1", [typeId]);
+    expect((await call(admin, "POST", "/shifts/batch", payload, uid())).json().code).toBe("STALE_VERSION");
+    await db.query("UPDATE users SET active=false WHERE id=$1", [ids[1]]);
+    expect((await call(admin, "POST", "/shifts/batch", { ...payload, assignments: [{ ...payload.assignments[0], type_version: 2 }] }, uid())).json().code).toBe("INACTIVE_USER");
+    expect(await db.query("SELECT * FROM shifts")).toHaveLength(0);
+  });
+  it("allows two nonoverlapping types for the same employee but rejects duplicates atomically", async () => {
+    const item = { user_id: ids[1], type_id: typeId, type_version: 1 };
+    expect((await call(admin, "POST", "/shifts/batch", { date: day, assignments: [item, item] }, uid())).json().code).toBe("BATCH_SHIFT_OVERLAP");
+    expect(await db.query("SELECT * FROM shifts")).toHaveLength(0);
+    const morning = (await call(admin, "POST", "/shift-types", { name: "Утро", start_time: "08:00", end_time: "15:00", pay_type: "hourly" })).json().id;
+    const result = await call(admin, "POST", "/shifts/batch", { date: day, assignments: [item, { ...item, type_id: morning }] }, uid());
+    expect(result.statusCode, result.body).toBe(200);
+    expect(await db.query("SELECT * FROM shifts")).toHaveLength(2);
+  });
   it("rejects overnight shifts, invalid dates and overlap; allows adjacent shifts", async () => {
     for (const extra of [
       { start_time: "22:00", end_time: "02:00" },
@@ -617,6 +674,29 @@ describe("Calendar and pay", () => {
   });
 });
 describe("Atomic exchange", () => {
+  it("allows taking only from 10:00 inclusive until 19:00 Minsk, including future-day shifts", async () => {
+    const id = await shift(), listing = await list(id), q = await quote(listing);
+    for (const localTime of ["00:00:00", "09:59:59", "19:00:00", "23:59:59"]) {
+      // The listing remains in the future so its own deadline does not mask
+      // the daily trading-hours rule.
+      clock = new Date(`${new Date(Date.parse(day) - 86400000).toISOString().slice(0, 10)}T${localTime}+03:00`);
+      expect((await call(b, "GET", `/exchange/${listing}/quote`)).statusCode).toBe(200);
+      const response = await call(b, "POST", `/exchange/${listing}/take`, { version: q.version }, uid());
+      expect(response.statusCode).toBe(409);
+      expect(response.json().code).toBe("EXCHANGE_HOURS");
+    }
+    clock = new Date(`${day}T07:00:00Z`); // 10:00 Minsk, not the execution host's zone.
+    expect((await call(b, "POST", `/exchange/${listing}/take`, { version: q.version }, uid())).statusCode).toBe(200);
+  });
+  it("allows 18:59:59 and permits an idempotent retry after closing without another transfer", async () => {
+    const id = await shift(), listing = await list(id), q = await quote(listing), key = uid();
+    clock = new Date(`${day}T18:59:59+03:00`);
+    const response = await call(b, "POST", `/exchange/${listing}/take`, { version: q.version }, key);
+    expect(response.statusCode).toBe(200);
+    clock = new Date(`${day}T19:00:00+03:00`);
+    expect((await call(b, "POST", `/exchange/${listing}/take`, { version: q.version }, key)).json()).toEqual(response.json());
+    expect(await db.query("SELECT * FROM audit_logs WHERE action='Смена забрана с биржи'")).toHaveLength(1);
+  });
   it("accepts Android's empty form POST for listing and withdrawing a shift", async () => {
     const id = await shift();
     const post = (path: string, client = a, payload = "") => app.inject({

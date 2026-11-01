@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { PushNotifications } from "@capacitor/push-notifications";
 import { Bell, BellOff, Send } from "lucide-react";
 import { api } from "./api";
+import { registerNativePushDevice } from "./native-push";
 export function NativePushControls({
   userId,
   config,
@@ -17,13 +18,13 @@ export function NativePushControls({
   const [registered, setRegistered] = useState(false),
     [busy, setBusy] = useState(false),
     [error, setError] = useState("");
-  const ready =
-    !!config?.push_ready &&
-    import.meta.env.VITE_NATIVE_FIREBASE_CONFIGURED === "true";
+  const built = import.meta.env.VITE_NATIVE_FIREBASE_CONFIGURED === "true";
+  const wrongProject = !!import.meta.env.VITE_NATIVE_FIREBASE_PROJECT_ID && !!config?.push_project_id && import.meta.env.VITE_NATIVE_FIREBASE_PROJECT_ID !== config.push_project_id;
+  const ready = !!(config?.push_android_ready ?? config?.push_ready) && built && !wrongProject;
   useEffect(() => {
     const id = localStorage.getItem("rcs-push-device");
     if (id && !offline)
-      api(`/me/push-status?device_id=${id}`)
+      api(`/me/push-status?platform=android&device_id=${id}`)
         .then((r) => setRegistered(r.registered))
         .catch(() => {});
   }, [userId, offline]);
@@ -39,48 +40,7 @@ export function NativePushControls({
     }
   }
   async function connect() {
-    let permission = await PushNotifications.checkPermissions();
-    if (permission.receive === "prompt")
-      permission = await PushNotifications.requestPermissions();
-    if (permission.receive !== "granted")
-      throw new Error("Разрешите уведомления для RCS в настройках Android");
-    await PushNotifications.createChannel({
-      id: "rcs",
-      name: "Смены и события RCS",
-      description: "Изменения графика, биржа и напоминания",
-      importance: 4,
-      visibility: 1,
-    });
-    const token = await new Promise<string>(async (resolve, reject) => {
-      const timeout = setTimeout(() => {
-        cleanup();
-        reject(new Error("Не удалось получить подписку. Проверьте интернет"));
-      }, 20000);
-      let success: any, failure: any;
-      function cleanup() {
-        clearTimeout(timeout);
-        void success?.remove();
-        void failure?.remove();
-      }
-      success = await PushNotifications.addListener("registration", (t) => {
-        cleanup();
-        resolve(t.value);
-      });
-      failure = await PushNotifications.addListener("registrationError", () => {
-        cleanup();
-        reject(new Error("Не удалось подключить уведомления Android"));
-      });
-      await PushNotifications.register().catch((e) => {
-        cleanup();
-        reject(e);
-      });
-    });
-    const device = await api("/me/push-devices", "POST", {
-      token,
-      platform: "android",
-    });
-    localStorage.setItem("rcs-push-device", device.id);
-    localStorage.setItem("rcs-push-user", userId);
+    await registerNativePushDevice(userId, true);
     setRegistered(true);
     report("Уведомления Android включены");
   }
@@ -102,8 +62,7 @@ export function NativePushControls({
       </span>
       {!ready && (
         <p className="muted small">
-          Отправка уведомлений на телефон станет доступна после настройки
-          сервера и Firebase для Android.
+          {wrongProject ? "Приложение и сервер подключены к разным проектам уведомлений. Установите актуальную версию RCS." : !built ? "Для подключения уведомлений установите обновление RCS с настроенным Firebase." : "Доставка уведомлений ещё не подключена на сервере."}
         </p>
       )}
       {error && (

@@ -1,5 +1,8 @@
 import { beforeAll, beforeEach, afterAll, describe, it, expect } from "vitest";
-import { createECDH } from "node:crypto";
+import { createECDH, generateKeyPairSync } from "node:crypto";
+import { mkdtemp, writeFile, unlink, rmdir } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { hash } from "@node-rs/argon2";
 import { openDatabase, type Database } from "../server/db";
 import { createApp } from "../server/app";
@@ -137,7 +140,7 @@ describe("Firebase configuration", () => {
     expect(JSON.stringify(result)).not.toContain("must-not-leak");
     expect(
       (await inspectPushSettings({ ...env, FIREBASE_VAPID_KEY: "invalid" }))
-        .ready,
+        .webReady,
     ).toBe(false);
     expect(
       (
@@ -145,7 +148,7 @@ describe("Firebase configuration", () => {
           ...env,
           APP_ORIGIN: "http://192.168.1.4:5173",
         })
-      ).ready,
+      ).webReady,
     ).toBe(false);
     expect(
       (
@@ -153,7 +156,7 @@ describe("Firebase configuration", () => {
           ...env,
           APP_ORIGIN: "http://localhost:5173",
         })
-      ).ready,
+      ).webReady,
     ).toBe(true);
     expect(
       (await inspectPushSettings({ ...env, FIREBASE_WEB_CONFIG: "broken" }))
@@ -172,8 +175,59 @@ describe("Firebase configuration", () => {
     expect(safePushLink("https://evil.example")).toBe("notifications");
     expect(safePushLink("shift:" + uid())).toMatch(/^shift:/);
   });
+  it("enables native Android with a service account, without Web config, VAPID or HTTPS hosting", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "rcs-firebase-")), file = join(directory, "service-account.json");
+    const key = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ format: "pem", type: "pkcs8" });
+    try {
+      await writeFile(file, JSON.stringify({ type: "service_account", project_id: web.projectId, client_email: `rcs-push@${web.projectId}.iam.gserviceaccount.com`, private_key: key.toString() }), { mode: 0o600 });
+      state = await inspectPushSettings({ GOOGLE_APPLICATION_CREDENTIALS: file, APP_ORIGIN: "http://192.168.1.7:3001" });
+      expect(state).toMatchObject({ ready: true, androidReady: true, webReady: false, projectId: web.projectId, config: null });
+      const me = (await request(1, "GET", "/auth/me")).json();
+      expect(me).toMatchObject({ push_ready: false, push_android_ready: true, push_project_id: web.projectId, push_config: null });
+      expect(JSON.stringify(me)).not.toContain("private_key");
+      const registered = await request(1, "POST", "/me/push-devices", { platform: "android", token: "native-only-token-" + uid(), user_id: users[1] });
+      expect(registered.statusCode).toBe(200);
+      expect((await request(1, "POST", "/me/push-test", { device_id: registered.json().id })).statusCode).toBe(200);
+      expect(sent[0].platform).toBe("android");
+      expect((await request(1, "POST", "/me/push-devices", { platform: "web", token: "disabled-web-token-" + uid() })).statusCode).toBe(409);
+      expect((await inspectPushSettings({ GOOGLE_APPLICATION_CREDENTIALS: file, FIREBASE_PROJECT_ID: "wrong-project" })).ready).toBe(false);
+    } finally { await unlink(file).catch(() => {}); await rmdir(directory); }
+  });
+  it("rejects registration from a stale account after the user changes", async () => {
+    expect((await request(1, "POST", "/me/push-devices", { token: "wrong-user-token-" + uid(), user_id: users[0] })).statusCode).toBe(403);
+    expect(await db.query("SELECT * FROM push_devices")).toHaveLength(0);
+  });
+  it("does not retry web deliveries while only the Android transport is configured", async () => {
+    for (let i = 0; i < 21; i++) await device();
+    await request(1, "POST", "/me/push-devices", { platform: "android", token: "native-queue-token-" + uid() });
+    await db.tx((sql) => notify(sql, [users[1]], "Событие RCS", "Смена изменена"));
+    state = { ...configured, androidReady: true, webReady: false };
+    await tick(db, gateway);
+    expect(sent).toHaveLength(1);
+    expect(sent[0].platform).toBe("android");
+    expect((await db.query("SELECT attempts FROM deliveries d JOIN push_devices p ON p.id=d.device_id WHERE p.platform='web'"))[0].attempts).toBe(0);
+  });
 });
 describe("Device setup and actual transport invocation", () => {
+  it("formats dates only in notification text, including older notification history", async () => {
+    await device();
+    await db.tx((sql) => notify(sql, [users[1]], "Вам назначена смена", "2026-11-02 · 08:00–15:00"));
+    expect((await db.query("SELECT body FROM notifications"))[0].body).toBe("02.11.2026 · 08:00–15:00");
+    await db.query("UPDATE notifications SET body='2026-11-02 · 08:00–15:00'");
+    expect((await request(1, "GET", "/notifications")).json()[0].body).toBe("02.11.2026 · 08:00–15:00");
+  });
+  it("suppresses old queued team/type notices while preserving manual announcements", async () => {
+    await device();
+    await db.tx(async (sql) => {
+      for (const [title, link] of [["Команда обновлена", "employees"], ["Типы смен обновлены", "types"], ["Новый сотрудник", "employees"]]) await notify(sql, [users[1]], title, "Служебная запись", "admin", link);
+      await notify(sql, [users[1]], "Сообщение управляющего", "Завтра открываемся в 09:00", "admin", "notifications");
+    });
+    await tick(db, gateway);
+    expect(sent.map((message) => message.title)).toEqual(["Сообщение управляющего"]);
+    expect(await db.query("SELECT * FROM notifications")).toHaveLength(4);
+    expect((await request(1, "GET", "/notifications")).json().map((notice: any) => notice.title)).toEqual(["Сообщение управляющего"]);
+    expect(await db.query("SELECT * FROM deliveries")).toHaveLength(1);
+  });
   it("preserves the Android platform through device registration and test sending", async () => {
     const r = await request(1, "POST", "/me/push-devices", {
       token: "android-token-" + uid(),
