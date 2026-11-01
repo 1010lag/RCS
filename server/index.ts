@@ -7,9 +7,12 @@ import { openDatabase } from "./db";
 import { createApp } from "./app";
 import { startWorker, tick } from "./worker";
 const db = await openDatabase();
-const app = await createApp(db, { logger: true });
+let wakeWorker = () => {};
+const app = await createApp(db, { logger: true, onMutation: () => wakeWorker() });
 app.get("/download/rcs.apk", async (_req, reply) => {
   const apk = resolve(".data/apk/RCS.apk");
+  if (!existsSync(apk) && process.env.APK_DOWNLOAD_URL)
+    return reply.redirect(process.env.APK_DOWNLOAD_URL);
   if (!existsSync(apk))
     return reply.code(404).send({ message: "APK ещё не собран" });
   return reply
@@ -27,6 +30,7 @@ if (existsSync("dist/index.html")) {
 }
 await tick(db);
 const stop = startWorker(db, (e) => app.log.error(e));
+wakeWorker = stop.wake;
 await app.listen({
   port: Number(process.env.PORT ?? 3001),
   host: process.env.HOST ?? "127.0.0.1",

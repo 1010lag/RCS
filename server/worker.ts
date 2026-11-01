@@ -142,18 +142,61 @@ export async function tick(db: Database, push: PushGateway = firebasePush) {
     }
   }
 }
+export async function nextWorkerDelay(db: Database, maxIdleMs: number, push: PushGateway = firebasePush) {
+  const settings = await push.settings();
+  const rows = await db.query(`
+    WITH deadlines AS (
+      SELECT end_at AS deadline FROM shifts WHERE status IN ('planned','confirmed') AND end_at>clock_timestamp()
+      UNION ALL SELECT start_at FROM shifts WHERE user_id IS NULL AND status<>'cancelled' AND start_at>clock_timestamp()
+      UNION ALL SELECT closes_at FROM exchange_listings WHERE status='open' AND closes_at>clock_timestamp()
+      UNION ALL SELECT closes_at-interval '30 minutes' FROM exchange_listings WHERE status='open' AND closes_at-interval '30 minutes'>clock_timestamp()
+      UNION ALL
+      SELECT s.start_at-(m.minutes::text||' minutes')::interval
+      FROM shifts s JOIN users u ON u.id=s.user_id AND u.active
+      CROSS JOIN (VALUES (120),(60)) m(minutes) LEFT JOIN preferences p ON p.user_id=s.user_id
+      WHERE s.status IN ('planned','confirmed')
+        AND CASE WHEN m.minutes=120 THEN COALESCE(p.reminder_120,true) ELSE COALESCE(p.reminder_60,false) END
+        AND s.start_at-(m.minutes::text||' minutes')::interval>clock_timestamp()
+      UNION ALL
+      SELECT d.next_attempt FROM deliveries d JOIN notifications n ON n.id=d.notification_id
+      JOIN push_devices p ON p.id=d.device_id AND p.user_id=n.user_id
+      JOIN sessions sess ON sess.id=p.session_id AND sess.user_id=p.user_id AND sess.expires_at>clock_timestamp()
+      JOIN users u ON u.id=n.user_id AND u.active LEFT JOIN preferences pref ON pref.user_id=n.user_id
+      WHERE ((p.platform='android' AND $1::boolean) OR (p.platform='web' AND $2::boolean))
+        AND d.sent_at IS NULL AND d.attempts<8 AND COALESCE((to_jsonb(pref)->>n.category)::boolean,true)
+    )
+    SELECT GREATEST(1000, LEAST($3::double precision,
+      COALESCE(EXTRACT(EPOCH FROM(min(deadline)-clock_timestamp()))*1000,$3::double precision))) AS delay_ms
+    FROM deadlines`, [platformPushReady(settings, "android"), platformPushReady(settings, "web"), maxIdleMs]);
+  return Math.ceil(Number(rows[0].delay_ms));
+}
+
 export function startWorker(db: Database, onError: (e: unknown) => void) {
-  let busy = false;
-  const timer = setInterval(async () => {
-    if (busy) return;
+  const maxIdleMs = Number(process.env.WORKER_IDLE_MS || 15000);
+  if (!Number.isFinite(maxIdleMs) || maxIdleMs < 1000 || maxIdleMs > 3600000)
+    throw new Error("WORKER_IDLE_MS must be between 1000 and 3600000.");
+  let busy = false, stopped = false, pending = false;
+  let timer: ReturnType<typeof setTimeout>;
+  const schedule = (delay: number) => { clearTimeout(timer); timer = setTimeout(run, delay); };
+  const run = async () => {
+    if (stopped || busy) return;
     busy = true;
+    let delay = Math.min(15000, maxIdleMs);
     try {
       await tick(db);
-    } catch (e) {
-      onError(e);
-    } finally {
+      delay = maxIdleMs > 15000 ? await nextWorkerDelay(db, maxIdleMs) : maxIdleMs;
+    } catch (e) { onError(e); }
+    finally {
       busy = false;
+      if (!stopped) schedule(pending ? 0 : delay);
+      pending = false;
     }
-  }, 15000);
-  return () => clearInterval(timer);
+  };
+  const wake = () => {
+    if (stopped) return;
+    if (busy) pending = true;
+    else schedule(0);
+  };
+  schedule(0);
+  return Object.assign(() => { stopped = true; clearTimeout(timer); }, { wake });
 }

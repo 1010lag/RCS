@@ -9,6 +9,7 @@
 - [Спецификация продукта, архитектура и план MVP](docs/PRODUCT_SPEC.md).
 - [Исходное задание](docs/ORIGINAL_REQUIREMENTS.txt).
 - [Android-приложение: APK, подключение к серверу и сборка](docs/ANDROID.md).
+- [Публичный сервер Render + Supabase и перенос данных](docs/HOSTING.md).
 
 ## Быстрый запуск
 

@@ -197,6 +197,16 @@ describe("Firebase configuration", () => {
     expect((await request(1, "POST", "/me/push-devices", { token: "wrong-user-token-" + uid(), user_id: users[0] })).statusCode).toBe(403);
     expect(await db.query("SELECT * FROM push_devices")).toHaveLength(0);
   });
+  it("accepts hosted service-account JSON without exposing it through the API", async () => {
+    const key = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ format: "pem", type: "pkcs8" }).toString();
+    const credential = JSON.stringify({ type: "service_account", project_id: web.projectId, client_email: `rcs-push@${web.projectId}.iam.gserviceaccount.com`, private_key: key });
+    state = await inspectPushSettings({ FIREBASE_SERVICE_ACCOUNT_JSON: credential, FIREBASE_PROJECT_ID: web.projectId });
+    expect(state).toMatchObject({ ready: true, androidReady: true, webReady: false });
+    const me = (await request(1, "GET", "/auth/me")).json();
+    expect(me.push_android_ready).toBe(true);
+    expect(JSON.stringify(me)).not.toContain("PRIVATE KEY");
+    expect((await inspectPushSettings({ FIREBASE_SERVICE_ACCOUNT_JSON: credential, FIREBASE_PROJECT_ID: "different-project" })).ready).toBe(false);
+  });
   it("does not retry web deliveries while only the Android transport is configured", async () => {
     for (let i = 0; i < 21; i++) await device();
     await request(1, "POST", "/me/push-devices", { platform: "android", token: "native-queue-token-" + uid() });

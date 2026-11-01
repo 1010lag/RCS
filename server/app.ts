@@ -91,7 +91,7 @@ const shiftSchema = z.object({
 });
 export async function createApp(
   db: Database,
-  options: { logger?: boolean; clock?: () => Date; push?: PushGateway } = {},
+  options: { logger?: boolean; clock?: () => Date; push?: PushGateway; onMutation?: () => void } = {},
 ) {
   const push = options.push ?? firebasePush;
   const cpu = new ResourceGate(2, 4), requests = new ResourceGate(48), usersBudget = new MemoryBudget();
@@ -115,7 +115,11 @@ export async function createApp(
     req.releaseCapacity = requests.enter();
     req.raw.once("aborted", req.releaseCapacity);
   });
-  app.addHook("onResponse", async (req) => req.releaseCapacity?.());
+  app.addHook("onResponse", async (req, reply) => {
+    req.releaseCapacity?.();
+    if (req.url.startsWith("/api/") && !["GET", "HEAD", "OPTIONS"].includes(req.method) && reply.statusCode < 400)
+      options.onMutation?.();
+  });
   app.addHook("onError", async (req) => req.releaseCapacity?.());
   app.addHook("onTimeout", async (req) => req.releaseCapacity?.());
   // Android's HTTP stack can label a bodyless POST as an empty HTML form.

@@ -96,3 +96,25 @@ WITH source AS (
 UPDATE adjustments a SET credit_amount=CASE WHEN x.minutes=0 THEN x.amount WHEN x.pay_type='shift' THEN x.amount WHEN x.rate IS NOT NULL AND x.pay_type='hourly' THEN round((x.base_minutes+x.running_minutes)*x.rate/60,2)-round((x.base_minutes+x.running_minutes-x.minutes)*x.rate/60,2)+x.amount ELSE NULL END FROM source x WHERE a.id=x.id AND a.credit_amount IS NULL;
 -- statement
 CREATE INDEX IF NOT EXISTS adjustments_owner ON adjustments(shift_id,user_id);
+-- statement
+-- RCS authorizes requests in its own server. Hosted Supabase's generated Data
+-- API must never expose these tables to its anonymous or browser-auth roles.
+DO $$
+DECLARE table_name text; api_role text;
+BEGIN
+  FOREACH table_name IN ARRAY ARRAY['users','sessions','shift_types','shifts','exchange_listings','adjustments','notifications','preferences','push_devices','deliveries','audit_logs','events','idempotency','request_limits'] LOOP
+    EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', table_name);
+    EXECUTE format('REVOKE ALL PRIVILEGES ON TABLE %I FROM PUBLIC', table_name);
+    FOREACH api_role IN ARRAY ARRAY['anon','authenticated'] LOOP
+      IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname=api_role) THEN
+        EXECUTE format('REVOKE ALL PRIVILEGES ON TABLE %I FROM %I', table_name, api_role);
+      END IF;
+    END LOOP;
+  END LOOP;
+  REVOKE ALL PRIVILEGES ON SEQUENCE events_id_seq FROM PUBLIC;
+  FOREACH api_role IN ARRAY ARRAY['anon','authenticated'] LOOP
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname=api_role) THEN
+      EXECUTE format('REVOKE ALL PRIVILEGES ON SEQUENCE events_id_seq FROM %I', api_role);
+    END IF;
+  END LOOP;
+END $$;

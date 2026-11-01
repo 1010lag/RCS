@@ -10,6 +10,8 @@
     "dev": "concurrently -k -n api,web \"tsx watch server/index.ts\" \"vite --host 127.0.0.1\"",
     "build": "tsc --noEmit && vite build",
     "start": "tsx server/index.ts",
+    "start:hosted": "tsx scripts/start-hosted.ts",
+    "db:transfer": "tsx scripts/transfer-database.ts",
     "demo": "tsx server/seed.ts",
     "admin": "tsx server/bootstrap.ts",
     "push:setup": "tsx scripts/setup-push.ts",

@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { createPrivateKey, ECDH } from "node:crypto";
-import { initializeApp, applicationDefault, getApps } from "firebase-admin/app";
+import { initializeApp, applicationDefault, cert, getApps } from "firebase-admin/app";
 import { getMessaging } from "firebase-admin/messaging";
 import { z } from "zod";
 import { notificationText } from "./notification-text";
@@ -51,9 +51,9 @@ export async function inspectPushSettings(env: NodeJS.ProcessEnv = process.env):
   } else issues.push("FIREBASE_WEB_CONFIG");
 
   let credentialsValid = false;
-  if (env.GOOGLE_APPLICATION_CREDENTIALS) {
+  if (env.FIREBASE_SERVICE_ACCOUNT_JSON || env.GOOGLE_APPLICATION_CREDENTIALS) {
     try {
-      const credential = JSON.parse(await readFile(env.GOOGLE_APPLICATION_CREDENTIALS, "utf8"));
+      const credential = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT_JSON || await readFile(env.GOOGLE_APPLICATION_CREDENTIALS!, "utf8"));
       if (credential.type !== "service_account" || typeof credential.project_id !== "string" || credential.project_id.length < 3 || typeof credential.client_email !== "string") throw new Error("CREDENTIAL");
       if (projectId && projectId !== credential.project_id) throw new Error("PROJECT");
       createPrivateKey(credential.private_key);
@@ -90,7 +90,7 @@ export async function inspectPushSettings(env: NodeJS.ProcessEnv = process.env):
   if (config && projectId && !webProjectMatches) { invalid = true; issues.push("Web-приложение и серверный аккаунт относятся к разным Firebase-проектам"); }
   const webReady = androidReady && webProjectMatches && Boolean(vapidKey && origin);
   const ready = androidReady || webReady;
-  const empty = !env.FIREBASE_PROJECT_ID && !env.FIREBASE_WEB_CONFIG && !env.FIREBASE_VAPID_KEY && !env.GOOGLE_APPLICATION_CREDENTIALS && env.FIREBASE_USE_ADC !== "1" && !env.APP_ORIGIN;
+  const empty = !env.FIREBASE_PROJECT_ID && !env.FIREBASE_WEB_CONFIG && !env.FIREBASE_VAPID_KEY && !env.GOOGLE_APPLICATION_CREDENTIALS && !env.FIREBASE_SERVICE_ACCOUNT_JSON && env.FIREBASE_USE_ADC !== "1" && !env.APP_ORIGIN;
   return {
     ready, androidReady, webReady, projectId,
     status: ready ? "ready" : invalid ? "invalid" : empty ? "unconfigured" : "incomplete",
@@ -107,6 +107,7 @@ export const firebasePush: PushGateway = {
       process.env.FIREBASE_WEB_CONFIG,
       process.env.FIREBASE_VAPID_KEY,
       process.env.GOOGLE_APPLICATION_CREDENTIALS,
+      process.env.FIREBASE_SERVICE_ACCOUNT_JSON,
       process.env.FIREBASE_USE_ADC,
       process.env.APP_ORIGIN,
     ]);
@@ -127,7 +128,7 @@ export const firebasePush: PushGateway = {
       getApps().find((a) => a.name === "rcs-push") ??
       initializeApp(
         {
-          credential: applicationDefault(),
+          credential: process.env.FIREBASE_SERVICE_ACCOUNT_JSON ? cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON)) : applicationDefault(),
           projectId: settings.projectId ?? settings.config?.projectId,
         },
         "rcs-push",

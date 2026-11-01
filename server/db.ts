@@ -14,7 +14,10 @@ export interface Database extends Sql {
 export async function openDatabase(path?: string): Promise<Database> {
   let db: Database;
   if (process.env.DATABASE_URL && path === undefined) {
-    const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 10, connectionTimeoutMillis: 3000 });
+    // Serverless PostgreSQL can need several seconds to wake from idle.
+    const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 10, connectionTimeoutMillis: 15000 });
+    // A managed database can retire an idle connection; the pool replaces it.
+    pool.on("error", (error: NodeJS.ErrnoException) => console.error("Idle PostgreSQL connection was closed:", error.code ?? error.name));
     db = {
       query: async (s, p) => (await pool.query(s, p)).rows,
       async tx(fn) {
