@@ -1,5 +1,7 @@
 # Публичный сервер: Render + Supabase
 
+Опубликованная версия: **https://rcs-team-1010lag.onrender.com**. Первоначальные данные перенесены 1 ноября 2026 года из локальной резервной копии. Вход, календарь, сотрудники, типы смен, расчёты, SSE и готовность Android push проверены через публичный HTTPS-адрес. Удалённые GitHub Actions и 98 локальных серверных тестов прошли.
+
 Приложение запускается целиком: React, API, SSE и worker обслуживает один Node.js-процесс, данные сохраняются в отдельной PostgreSQL. Компьютер в кофейне после переноса не нужен. HTTPS предоставляет хостинг.
 
 ## Бесплатные тарифы
@@ -15,8 +17,8 @@
 1. Создайте проект Supabase Free. В Connect выберите **Session pooler**, порт **5432**: он доступен по IPv4 и сохраняет сессию соединения. Бесплатный прямой адрес Supabase использует IPv6, недоступный для исходящих соединений Render. Строку подключения с TLS храните как секрет. Приложение использует PostgreSQL напрямую, Supabase Auth и браузерный Data API ему не нужны.
 2. Перенесите данные по инструкции ниже **до запуска публичного сервера**, чтобы worker не создал записи в пустой базе назначения.
 3. В Render создайте Blueprint по `render.yaml` из репозитория `https://github.com/1010lag/RCS`. Он выбирает Free, Node.js 24, сборку `npm ci --include=dev && npm run build`, запуск `npm run start:hosted`, health check `/api/health`.
-4. В `DATABASE_URL` передайте Session pooler URI Supabase с TLS. `APP_ORIGIN` берётся из `RENDER_EXTERNAL_URL`; для собственного домена укажите полный HTTPS origin без пути. `HOST=0.0.0.0`, `NODE_ENV=production` уже заданы в Blueprint. Сертификат Supabase при необходимости добавьте как доверенный CA, не отключая проверку TLS.
-5. Для Android push добавьте `FIREBASE_SERVICE_ACCOUNT_JSON` — полный JSON существующего сервисного аккаунта, как секретную переменную, и `FIREBASE_PROJECT_ID=rcs-pro`. Если хостинг поддерживает секретные файлы, вместо JSON-переменной можно использовать `GOOGLE_APPLICATION_CREDENTIALS` с путём к смонтированному файлу. Не добавляйте закрытый JSON в Git или публичные файлы сайта.
+4. В `DATABASE_URL` передайте Session pooler URI Supabase с параметрами `sslmode=verify-full&sslrootcert=server/certs/supabase-root-2021.crt`. Официальный открытый CA-сертификат Supabase включён в репозиторий, проверка сертификата и имени сервера сохранена. `APP_ORIGIN` берётся из `RENDER_EXTERNAL_URL`; для собственного домена укажите полный HTTPS origin без пути. `HOST=0.0.0.0`, `NODE_ENV=production` уже заданы в Blueprint.
+5. В действующей установке Android push использует секретный файл Render `firebase-service-account.json`, переменные `GOOGLE_APPLICATION_CREDENTIALS=/etc/secrets/firebase-service-account.json` и `FIREBASE_PROJECT_ID=rcs-pro`. Для других хостингов поддерживается альтернативная секретная переменная `FIREBASE_SERVICE_ACCOUNT_JSON` с полным JSON. Не добавляйте закрытый JSON в Git или публичные файлы сайта.
 6. Если нужен маршрут скачивания APK, задайте `APK_DOWNLOAD_URL` — публичный HTTPS-адрес существующего APK. Он используется только при отсутствии `.data/apk/RCS.apk` на сервере.
 7. Откройте публичный адрес, проверьте `/api/health`, вход, календарь, ставки, аватарки, сохранение изменений и обновление второго клиента. Проверьте повторное открытие после перезапуска.
 
