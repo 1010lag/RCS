@@ -1,4 +1,4 @@
-param([string]$ApiUrl = 'http://192.168.1.7:3001')
+param([string]$ApiUrl = 'https://rcs-team-1010lag.onrender.com')
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath (Split-Path -Parent $PSScriptRoot)
 $toolsRoot = Join-Path $env:USERPROFILE '.codex\.tmp'

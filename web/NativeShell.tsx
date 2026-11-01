@@ -2,11 +2,10 @@ import { useEffect, useState, type ReactNode } from "react";
 import { ArrowRight, RefreshCw, Server, Settings } from "lucide-react";
 import {
   checkServer,
-  clearNativeCookies,
   serverBase,
   validateServer,
 } from "./runtime";
-import { cacheClear } from "./api";
+import { prepareNativeServer, switchNativeServer } from "./native-server";
 export function NativeShell({ children }: { children: ReactNode }) {
   const [phase, setPhase] = useState<"checking" | "choose" | "ready">(
       "checking",
@@ -16,7 +15,11 @@ export function NativeShell({ children }: { children: ReactNode }) {
     [error, setError] = useState("");
   useEffect(() => {
     let live = true;
-    checkServer(serverBase())
+    prepareNativeServer()
+      .then((url) => {
+        if (live) setAddress(url);
+        return checkServer(url);
+      })
       .then(() => {
         if (live) setPhase("ready");
       })
@@ -24,7 +27,7 @@ export function NativeShell({ children }: { children: ReactNode }) {
         if (live) {
           setPhase("choose");
           setError(
-            "Сервер недоступен. Проверьте подключение к Wi-Fi и адрес сервера.",
+            "Сервер недоступен. Проверьте интернет и адрес сервера. После простоя запуск может занять около минуты.",
           );
         }
       });
@@ -45,18 +48,11 @@ export function NativeShell({ children }: { children: ReactNode }) {
     try {
       const url = validateServer(address);
       await checkServer(url);
-      if (url !== serverBase()) {
-        await cacheClear();
-        await clearNativeCookies();
-        sessionStorage.removeItem("rcs-user");
-        localStorage.removeItem("rcs-push-device");
-        localStorage.removeItem("rcs-push-user");
-      }
-      localStorage.setItem("rcs-server", url);
+      await switchNativeServer(url);
       setPhase("ready");
     } catch (e: any) {
       setError(
-        "Не удалось подключиться к серверу RCS. Компьютер с сервером должен быть включён и доступен в вашей сети.",
+        "Не удалось подключиться к RCS. Проверьте интернет и адрес сервера; при первом запуске после простоя попробуйте ещё раз через минуту.",
       );
     } finally {
       setBusy(false);
@@ -115,8 +111,7 @@ export function NativeShell({ children }: { children: ReactNode }) {
             Открыть сохранённые данные
           </button>
           <small>
-            Для домашней проверки телефон и компьютер должны быть в одной Wi-Fi
-            сети.
+            Публичный сервер работает через Wi-Fi и мобильный интернет.
           </small>
         </form>
       )}

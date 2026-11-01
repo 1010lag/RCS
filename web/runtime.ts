@@ -1,5 +1,7 @@
 import { Capacitor, CapacitorHttp, CapacitorCookies } from "@capacitor/core";
 export const nativeApp = Capacitor.isNativePlatform();
+export const DEFAULT_SERVER = import.meta.env.VITE_API_URL ?? "https://rcs-team-1010lag.onrender.com";
+export const LEGACY_LAN_SERVER = "http://192.168.1.7:3001";
 export function validateServer(value: string) {
   const url = new URL(value.trim());
   if (
@@ -25,9 +27,7 @@ export function validateServer(value: string) {
 }
 export function serverBase() {
   return nativeApp
-    ? (localStorage.getItem("rcs-server") ??
-        import.meta.env.VITE_API_URL ??
-        "http://192.168.1.7:3001")
+    ? (localStorage.getItem("rcs-server") ?? DEFAULT_SERVER)
     : "";
 }
 export async function nativeRequest(
@@ -51,8 +51,8 @@ export async function nativeRequest(
 export async function checkServer(address: string) {
   const response = await CapacitorHttp.get({
     url: validateServer(address) + "/api/health",
-    connectTimeout: 6000,
-    readTimeout: 6000,
+    connectTimeout: 15000,
+    readTimeout: 60000,
     responseType: "json",
   });
   if (response.status !== 200 || !response.data?.ok)
