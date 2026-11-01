@@ -219,8 +219,32 @@ test("light and dark themes persist across reloads and synchronize between tabs"
   }]);
   await page.goto("/#profile");
   await expect(page.getByRole("button", { name: "Светлая", exact: true })).toHaveAttribute("aria-pressed", "true");
+  async function checkSwitchAlignment() {
+    await expect(page.locator(".toggle-row input").first()).toBeVisible();
+    const style = await page.addStyleTag({ content: ".toggle-row input::before { transition: none !important; }" });
+    const measurements = await page.locator(".toggle-row input").evaluateAll((inputs) => inputs.flatMap((element) => {
+      const input = element as HTMLInputElement, original = input.checked;
+      const result = [false, true].map((checked) => {
+        input.checked = checked;
+        const track = getComputedStyle(input), thumb = getComputedStyle(input, "::before"), box = input.getBoundingClientRect();
+        const shift = thumb.transform === "none" ? new DOMMatrix() : new DOMMatrix(thumb.transform);
+        const top = parseFloat(thumb.top) + parseFloat(track.borderTopWidth) + shift.m42;
+        const left = parseFloat(thumb.left) + parseFloat(track.borderLeftWidth) + shift.m41;
+        return { top, bottom: box.height - top - parseFloat(thumb.height), edge: checked ? box.width - left - parseFloat(thumb.width) : left };
+      });
+      input.checked = original;
+      return result;
+    }));
+    for (const thumb of measurements) {
+      expect(Math.abs(thumb.top - thumb.bottom)).toBeLessThan(0.1);
+      expect(Math.abs(thumb.top - thumb.edge)).toBeLessThan(0.1);
+    }
+    await style.evaluate((element) => (element as HTMLElement).remove());
+  }
+  await checkSwitchAlignment();
   await page.getByRole("button", { name: "Тёмная", exact: true }).click();
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await checkSwitchAlignment();
   await expect(page.locator(".preferences")).toHaveCSS("background-color", "rgb(24, 24, 28)");
   await page.reload();
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
@@ -517,11 +541,20 @@ test("barista uploads an avatar that persists and appears in day and month calen
   await expect(page.locator(".profile-card > .avatar img")).toHaveCount(0);
 });
 
-test("month calendar contains only its dates and aligns weekdays for 28, 29, 30 and 31 day months", async ({ page }) => {
+test("month calendar has continuous readable weeks, boundary shifts and fits a phone", async ({ page }) => {
   await page.context().addCookies([{
     name: "rcs_session", value: "calendar-ui-test-session",
     url: "http://127.0.0.1:3181", httpOnly: true, sameSite: "Strict",
   }]);
+  const team = await (await page.request.get("/api/team")).json();
+  const types = await (await page.request.get("/api/shift-types")).json();
+  for (const date of ["2026-10-26", "2026-12-06"]) {
+    const response = await page.request.post("/api/shifts", { headers: { "X-CSRF-Token": "calendar-csrf" }, data: {
+      date, start_time: "10:00", end_time: "11:00", type_id: types[0].id,
+      user_id: team.find((user: any) => user.name === "Анна Смирнова").id, status: "confirmed",
+    } });
+    expect(response.ok(), await response.text()).toBe(true);
+  }
   await page.route("**/api/auth/me", async (route) => {
     const response = await route.fetch();
     await route.fulfill({ response, json: { ...await response.json(), server_now: "2026-11-01T12:00:00+03:00" } });
@@ -529,38 +562,46 @@ test("month calendar contains only its dates and aligns weekdays for 28, 29, 30 
   await page.goto("/#schedule");
   await page.getByRole("button", { name: "Месяц", exact: true }).click();
   async function checkMonth(month: string, days: number) {
-    const cells = page.locator(".month-cell");
-    await expect(cells).toHaveCount(days);
-    const expected = Array.from({ length: days }, (_, index) => `${month}-${String(index + 1).padStart(2, "0")}`);
-    expect(await cells.evaluateAll((items) => items.map((item) => item.getAttribute("data-date")))).toEqual(expected);
-    await expect(page.locator(".month-day")).toHaveText(Array.from({ length: days }, (_, index) => String(index + 1)));
-    await expect(page.locator(".month-add")).toHaveCount(days);
     const column = (new Date(`${month}-01`).getUTCDay() + 6) % 7 + 1;
-    await expect(cells.first()).toHaveCSS("grid-column-start", String(column));
-    await expect(page.locator(".month-cell.outside")).toHaveCount(0);
     const rows = Math.ceil((days + column - 1) / 7);
-    await expect(page.locator(".month-grid > div")).toHaveCount(rows * 7);
-    const placeholders = page.locator(".month-placeholder");
-    await expect(placeholders.locator("button")).toHaveCount(0);
-    await expect(placeholders).toHaveCount(rows * 7 - days);
-    const bounds = await page.locator(".month-grid > div").evaluateAll((items) => items.map((item) => {
+    const cells = page.locator(".month-cell"), current = page.locator(".month-cell.current-month");
+    await expect(cells).toHaveCount(rows * 7);
+    await expect(current).toHaveCount(days);
+    expect(await current.evaluateAll((items) => items.map((item) => item.getAttribute("data-date")))).toEqual(
+      Array.from({ length: days }, (_, index) => `${month}-${String(index + 1).padStart(2, "0")}`),
+    );
+    await expect(current.locator(".month-day-number")).toHaveText(Array.from({ length: days }, (_, index) => String(index + 1)));
+    await expect(page.locator(".month-add")).toHaveCount(days);
+    await expect(page.locator(".month-placeholder")).toHaveCount(0);
+    const dates = await cells.evaluateAll((items) => items.map((item) => item.getAttribute("data-date")!));
+    expect(new Date(dates[0]).getUTCDay()).toBe(1);
+    expect(new Date(dates.at(-1)!).getUTCDay()).toBe(0);
+    for (let i = 1; i < dates.length; i++) expect(Date.parse(dates[i]) - Date.parse(dates[i - 1])).toBe(86400000);
+    const bounds = await cells.evaluateAll((items) => items.map((item) => {
       const box = item.getBoundingClientRect();
-      return { x: box.x, y: box.y, width: box.width, height: box.height };
+      return { x: box.x, y: box.y, width: box.width, height: box.height, adjacent: item.classList.contains("adjacent-month"), background: getComputedStyle(item).backgroundColor };
     }));
-    for (let row = 0; row < rows; row++) {
-      for (let column = 0; column < 7; column++) {
-        const cell = bounds[row * 7 + column];
-        expect(Math.abs(cell.x - bounds[column].x)).toBeLessThan(1);
-        expect(Math.abs(cell.y - bounds[row * 7].y)).toBeLessThan(1);
-        expect(Math.abs(cell.width - bounds[0].width)).toBeLessThan(1);
-        expect(Math.abs(cell.height - bounds[row * 7].height)).toBeLessThan(1);
-      }
+    for (let row = 0; row < rows; row++) for (let col = 0; col < 7; col++) {
+      const cell = bounds[row * 7 + col];
+      expect(Math.abs(cell.x - bounds[col].x)).toBeLessThan(1);
+      expect(Math.abs(cell.y - bounds[row * 7].y)).toBeLessThan(1);
+      expect(Math.abs(cell.width - bounds[0].width)).toBeLessThan(1);
+      expect(Math.abs(cell.height - bounds[row * 7].height)).toBeLessThan(1);
+      expect(cell.background).toBe(bounds.find((other) => other.adjacent === cell.adjacent)!.background);
     }
+    const first = await current.first().boundingBox();
+    if (bounds.some((cell) => cell.adjacent)) expect(bounds.find((cell) => cell.adjacent)!.background).not.toBe(bounds.find((cell) => !cell.adjacent)!.background);
+    expect(Math.abs(first!.x - bounds[column - 1].x)).toBeLessThan(1);
+    await expect(cells.first().locator(".month-day-month")).toBeVisible();
+    await expect(current.first().locator(".month-day-month")).toBeVisible();
     return rows;
   }
   expect(await checkMonth("2026-11", 30)).toBe(6);
+  for (const date of ["2026-10-26", "2026-12-06"]) await expect(page.locator(`.month-cell[data-date="${date}"] .shift-chip`)).toContainText("10:00");
+  await page.screenshot({ path: ".data/qa/calendar-redesign-light.png", fullPage: true });
   await page.evaluate(() => { document.documentElement.dataset.theme = "dark"; });
-  await page.screenshot({ path: ".data/qa/calendar-november-dark.png", fullPage: true });
+  await checkMonth("2026-11", 30);
+  await page.screenshot({ path: ".data/qa/calendar-redesign-dark.png", fullPage: true });
   await page.getByRole("button", { name: "Предыдущий период", exact: true }).click();
   expect(await checkMonth("2026-10", 31)).toBe(5);
   for (let i = 0; i < 3; i++) await page.getByRole("button", { name: "Следующий период", exact: true }).click();
@@ -569,9 +610,12 @@ test("month calendar contains only its dates and aligns weekdays for 28, 29, 30 
   expect(await checkMonth("2027-02", 28)).toBe(4);
   for (let i = 0; i < 12; i++) await page.getByRole("button", { name: "Следующий период", exact: true }).click();
   expect(await checkMonth("2028-02", 29)).toBe(5);
-  await page.screenshot({ path: ".data/qa/calendar-month-only.png", fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });
   await checkMonth("2028-02", 29);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+  await page.screenshot({ path: ".data/qa/calendar-redesign-mobile.png", fullPage: true });
+  await page.locator('.current-month[data-date="2028-02-01"] .month-day').click();
+  await expect(page.getByRole("button", { name: "День", exact: true })).toHaveClass("active");
 });
 
 test("admin edits employee login data and their own phone and password", async ({ page }) => {
@@ -601,6 +645,13 @@ test("admin edits employee login data and their own phone and password", async (
   await dialog.getByLabel("Номер телефона", { exact: true }).fill("+375299999991");
   await dialog.getByLabel("Новый пароль", { exact: true }).fill("AdminMobile!2026");
   await dialog.getByLabel("Текущий пароль", { exact: true }).fill("BrowserTests!2026");
+  // The old SSE connection must be revoked while the credential response is
+  // still in flight, without logging out the newly authenticated browser.
+  await page.route("**/api/employees/*", async (route) => {
+    const response = await route.fetch();
+    await new Promise((resolve) => setTimeout(resolve, 1300));
+    await route.fulfill({ response });
+  });
   await dialog.getByRole("button", { name: "Сохранить", exact: true }).click();
   await expect(page.getByRole("status")).toContainText("Данные для входа обновлены");
   await expect(page.locator(".profile-card")).toContainText("+375299999991");

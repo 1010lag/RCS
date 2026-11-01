@@ -172,6 +172,7 @@ export function App() {
     [menu, setMenu] = useState(false);
   const timeBase = useRef({ server: Date.now(), local: performance.now() }),
     requestSeq = useRef(0),
+    pendingMutation = useRef<Promise<any> | null>(null),
     activeUser = useRef<string | null>(null);
   const today = minskDate(now),
     isAdmin = user?.role === "admin";
@@ -250,6 +251,21 @@ export function App() {
     window.addEventListener("hashchange", update);
     return () => window.removeEventListener("hashchange", update);
   }, [user]);
+  async function confirmCurrentSession(id: string) {
+    // A credential update can revoke the old SSE session before its response
+    // installs the new cookie. Wait for that update before checking access.
+    await pendingMutation.current?.catch(() => {});
+    if (activeUser.current !== id) return false;
+    try {
+      const me = await api("/auth/me");
+      if (activeUser.current !== id || me.user.id !== id) return false;
+      setCsrf(me.csrf);
+      return true;
+    } catch (error: any) {
+      if (error.status === 401 && activeUser.current === id) await forget();
+      return false;
+    }
+  }
   async function load() {
     if (!user || user.must_change_password) return;
     const id = user.id,
@@ -289,9 +305,9 @@ export function App() {
       setError("");
       await cacheWrite(id, snapshot).catch(() => {});
     } catch (e: any) {
-      if (activeUser.current !== id) return;
+      if (activeUser.current !== id || seq !== requestSeq.current) return;
       if (e.status === 401) {
-        await forget();
+        if (await confirmCurrentSession(id)) void load();
         return;
       }
       if (!navigator.onLine || !(e instanceof ApiError)) {
@@ -308,6 +324,7 @@ export function App() {
   }, [user?.id, user?.must_change_password, anchor]);
   useEffect(() => {
     if (!user || user.must_change_password) return;
+    let disposed = false;
     let source: EventSource | null = null,
       timer: ReturnType<typeof setInterval> | undefined;
     const changed = () => {
@@ -326,18 +343,24 @@ export function App() {
             changed();
           }
         } catch (e: any) {
-          if (e.status === 401) void forget();
+          if (e.status === 401 && await confirmCurrentSession(user.id) && !disposed) changed();
         } finally {
           polling = false;
         }
       }, 2000);
-    } else {
+    }
+    const connect = () => {
+      if (nativeApp || disposed) return;
+      source?.close();
       source = new EventSource("/api/events");
       source.addEventListener("change", changed);
       source.addEventListener("revoked", () => {
-        void forget();
+        source?.close();
+        void confirmCurrentSession(user.id).then((valid) => { if (valid && !disposed) { connect(); changed(); } });
       });
-    }
+    };
+    connect();
+    window.addEventListener("rcs-push-revoked", connect);
     const online = () => {
         void load();
       },
@@ -345,10 +368,12 @@ export function App() {
     window.addEventListener("online", online);
     window.addEventListener("offline", offlineEvent);
     return () => {
+      disposed = true;
       source?.close();
       if (timer) clearInterval(timer);
       window.removeEventListener("online", online);
       window.removeEventListener("offline", offlineEvent);
+      window.removeEventListener("rcs-push-revoked", connect);
     };
   }, [user?.id, user?.must_change_password, anchor]);
   useEffect(() => {
@@ -431,8 +456,11 @@ export function App() {
     }
     setBusy(true);
     setError("");
+    let pending: Promise<any> | undefined;
     try {
-      await action();
+      pending = action();
+      pendingMutation.current = pending;
+      await pending;
       setModal(null);
       setToast(message);
       await load();
@@ -441,6 +469,7 @@ export function App() {
       setError(e.message);
       return false;
     } finally {
+      if (pendingMutation.current === pending) pendingMutation.current = null;
       setBusy(false);
     }
   }

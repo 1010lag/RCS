@@ -11,11 +11,9 @@ import { Avatar, Empty } from "./App";
 import {
   addDays,
   weekStart,
-  monthStart,
-  monthEnd,
+  monthGridRange,
   moveMonth,
   label,
-  hours,
 } from "./dates";
 type Props = {
   shifts: Shift[];
@@ -62,10 +60,8 @@ export function Schedule({
       u.name.toLowerCase().includes(search.toLowerCase()),
   );
   const visibleDays = mode === "day" ? [anchor] : days;
-  const firstMonthDay = monthStart(anchor),
-    monthLength = Number(monthEnd(anchor).slice(-2)),
-    leadingCells = (new Date(firstMonthDay).getUTCDay() + 6) % 7,
-    trailingCells = (7 - (leadingCells + monthLength) % 7) % 7;
+  const [monthFrom, monthTo] = monthGridRange(anchor),
+    monthDays = Array.from({ length: Math.round((Date.parse(monthTo) - Date.parse(monthFrom)) / 86400000) + 1 }, (_, index) => addDays(monthFrom, index));
   const dateTitle =
     mode === "month"
       ? label(anchor, { month: "long", year: "numeric" })
@@ -83,6 +79,7 @@ export function Schedule({
     return (
       <button
         key={s.id}
+        aria-label={`${s.user_name ?? "Не назначена"}, ${s.start_time}–${s.end_time}, ${s.type_name}`}
         onClick={() => open(s)}
         className={`shift-chip ${s.exchange_id ? "exchange" : s.type_name.toLowerCase().includes("закрыт") ? "closing" : ""}`}
       >
@@ -160,72 +157,54 @@ export function Schedule({
         </div>
       </div>
       {mode === "month" ? (
-        <>
+        <div className="month-calendar" aria-label={dateTitle}>
           <div className="month-weekdays">
-            {["ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС"].map((d) => (
-              <span key={d}>{d}</span>
+            {["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"].map((day, index) => (
+              <span key={day}><abbr title={day}>{["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"][index]}</abbr></span>
             ))}
           </div>
           <div className="month-grid">
-            {Array.from({ length: leadingCells }, (_, index) => (
-              <div key={`before-${index}`} className="month-placeholder" aria-hidden="true" />
-            ))}
-            {Array.from({ length: monthLength }, (_, i) =>
-              addDays(firstMonthDay, i),
-            ).map((day, index) => (
+            {monthDays.map((day, index) => {
+              const outside = day.slice(0, 7) !== anchor.slice(0, 7);
+              const dayShifts = source.filter((shift) => shift.date === day && (!search || shift.user_name?.toLowerCase().includes(search.toLowerCase())));
+              const openDay = () => { setAnchor(day); setMode("day"); };
+              return (
               <div
                 key={day}
                 data-date={day}
-                className={`month-cell ${day === today ? "is-today" : ""}`}
-                style={index === 0 ? { gridColumnStart: (new Date(day).getUTCDay() + 6) % 7 + 1 } : undefined}
+                className={`month-cell ${outside ? "adjacent-month" : "current-month"} ${day === today ? "is-today" : ""}`}
               >
+                <div className="month-date-header">
                 <button
                   className="month-day"
-                  onClick={() => {
-                    setAnchor(day);
-                    setMode("day");
-                  }}
+                  aria-label={label(day, { weekday: "long", day: "numeric", month: "long", year: "numeric" })}
+                  aria-current={day === today ? "date" : undefined}
+                  onClick={openDay}
                 >
-                  {Number(day.slice(-2))}
+                  <span className="month-day-number">{Number(day.slice(-2))}</span>
+                  {(index === 0 || day.endsWith("-01")) && <span className="month-day-month">{label(day, { month: "short" })}</span>}
                 </button>
-                {source
-                  .filter(
-                    (s) =>
-                      s.date === day &&
-                      (!search ||
-                        s.user_name
-                          ?.toLowerCase()
-                          .includes(search.toLowerCase())),
-                  )
-                  .slice(0, 4)
-                  .map(chip)}
-                {source.filter((s) => s.date === day).length > 4 && (
+                {admin && !outside && (
+                  <button className="month-add" aria-label={`Добавить смену ${label(day)}`} onClick={() => create(day)}><Plus size={15} /></button>
+                )}
+                </div>
+                <div className="month-events">
+                {dayShifts.slice(0, 2).map(chip)}
+                {dayShifts.length > 2 && (
                   <button
-                    className="text-link small"
-                    onClick={() => {
-                      setAnchor(day);
-                      setMode("day");
-                    }}
+                    className="month-more"
+                    aria-label={`Ещё ${dayShifts.length - 2} смены, ${label(day)}`}
+                    onClick={openDay}
                   >
-                    Все смены →
+                    Ещё {dayShifts.length - 2}
                   </button>
                 )}
-                {admin && (
-                  <button
-                    className="month-add"
-                    aria-label={`Добавить смену ${label(day)}`}
-                    onClick={() => create(day)}
-                  >
-                    <Plus size={14} />
-                  </button>
-                )}
+                </div>
               </div>
-            ))}
-            {Array.from({ length: trailingCells }, (_, index) => (
-              <div key={`after-${index}`} className="month-placeholder" aria-hidden="true" />
-            ))}
+              );
+            })}
           </div>
-        </>
+        </div>
       ) : (
         <div className="table-scroll schedule-scroll">
           <table

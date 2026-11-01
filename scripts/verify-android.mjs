@@ -57,25 +57,46 @@ try {
   await page.getByRole("button", { name: "Месяц", exact: true }).click();
   const month = await page.locator(".month-grid").evaluate((grid) => {
     const dates = [...grid.querySelectorAll(".month-cell")].map((cell) => cell.dataset.date);
+    const currentDates = [...grid.querySelectorAll(".current-month")].map((cell) => cell.dataset.date);
     const boxes = [...grid.children].map((cell) => {
       const box = cell.getBoundingClientRect();
-      return { x: box.x, y: box.y, width: box.width, height: box.height };
+      return { x: box.x, y: box.y, width: box.width, height: box.height, adjacent: cell.classList.contains("adjacent-month"), background: getComputedStyle(cell).backgroundColor };
     });
-    return { dates, boxes, blankButtons: grid.querySelectorAll(".month-placeholder button").length };
+    return { dates, currentDates, boxes, blanks: grid.querySelectorAll(".month-placeholder").length, overflow: document.documentElement.scrollWidth > innerWidth + 1 };
   });
-  if (month.dates.length < 28 || month.dates.some((date) => date.slice(0, 7) !== month.dates[0].slice(0, 7))) throw new Error("Calendar contains dates outside its month.");
-  if (month.boxes.length % 7 || month.blankButtons) throw new Error("Month grid is incomplete or has interactive blank cells.");
+  if (month.currentDates.length < 28 || month.currentDates.some((date) => date.slice(0, 7) !== month.currentDates[0].slice(0, 7))) throw new Error("Selected-month dates are missing.");
+  if (month.boxes.length % 7 || month.blanks || month.overflow) throw new Error("Month has blank blocks or horizontal overflow.");
+  if (new Date(month.dates[0]).getUTCDay() !== 1 || new Date(month.dates.at(-1)).getUTCDay() !== 0) throw new Error("Calendar weeks are incomplete.");
+  for (let i = 1; i < month.dates.length; i++) if (Date.parse(month.dates[i]) - Date.parse(month.dates[i - 1]) !== 86400000) throw new Error("Calendar dates are not consecutive.");
   for (let i = 0; i < month.boxes.length; i++) {
     const cell = month.boxes[i], firstInRow = month.boxes[Math.floor(i / 7) * 7];
-    if (Math.abs(cell.x - month.boxes[i % 7].x) > 1 || Math.abs(cell.y - firstInRow.y) > 1 || Math.abs(cell.height - firstInRow.height) > 1) throw new Error("Month calendar has uneven rows or columns.");
+    if (Math.abs(cell.x - month.boxes[i % 7].x) > 1 || Math.abs(cell.y - firstInRow.y) > 1 || Math.abs(cell.height - firstInRow.height) > 1) throw new Error("Month calendar has uneven cells.");
   }
   await mkdir(".data/qa/phone", { recursive: true });
   await page.screenshot({ path: ".data/qa/phone/calendar-month.png", timeout: 10000 });
-  record("Month is a complete rectangular grid with only selected-month dates");
+  record("Month has consecutive weeks, readable boundary dates and no blank grey blocks or horizontal scrolling");
   await page.getByRole("button", { name: "День", exact: true }).click();
   await navigate("Профиль", "Настройки");
   await expect(page.getByRole("heading", { name: "Профиль", exact: true }).first()).toBeVisible();
   record("Profile opens");
+  await expect(page.locator(".toggle-row input").first()).toBeVisible();
+  const switchStyle = await page.addStyleTag({ content: ".toggle-row input::before { transition: none !important; }" });
+  const switchGaps = await page.locator(".toggle-row input").evaluateAll((inputs) => inputs.flatMap((input) => {
+    const original = input.checked;
+    const result = [false, true].map((checked) => {
+      input.checked = checked;
+      const track = getComputedStyle(input), thumb = getComputedStyle(input, "::before"), box = input.getBoundingClientRect();
+      const shift = thumb.transform === "none" ? new DOMMatrix() : new DOMMatrix(thumb.transform);
+      const top = parseFloat(thumb.top) + parseFloat(track.borderTopWidth) + shift.m42;
+      const left = parseFloat(thumb.left) + parseFloat(track.borderLeftWidth) + shift.m41;
+      return { top, bottom: box.height - top - parseFloat(thumb.height), edge: checked ? box.width - left - parseFloat(thumb.width) : left };
+    });
+    input.checked = original;
+    return result;
+  }));
+  for (const gap of switchGaps) if (Math.abs(gap.top - gap.bottom) > 0.1 || Math.abs(gap.top - gap.edge) > 0.1) throw new Error("Switch thumb is not centered.");
+  await switchStyle.evaluate((element) => element.remove());
+  record("Switch thumbs have equal vertical and end gaps in both positions");
   if (await page.getByRole("button", { name: "Тёмная", exact: true }).count()) {
     const originalTheme = await page.evaluate(() => localStorage.getItem("rcs-theme"));
     await page.getByRole("button", { name: "Тёмная", exact: true }).click();

@@ -24,6 +24,10 @@
   background: #202026;
   box-shadow: inset 0 0 0 1px var(--border);
 }
+:root[data-theme="dark"] .month-calendar {
+  --calendar-adjacent: #2b303a;
+  --calendar-adjacent-text: #bdc7d5;
+}
 :root[data-theme="dark"] .modal {
   background: var(--surface);
 }
