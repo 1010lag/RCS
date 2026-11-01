@@ -247,6 +247,36 @@ describe("Reported logic regressions", () => {
     expect(log.after_value).toMatchObject({ user_name: "Анна", type_name: "Закрытие", start_time: "20:00", end_time: "22:00", date: day });
   });
 });
+describe("Administrative audit cleanup", () => {
+  it("deletes through the selected Minsk day, preserves newer logs and business records, and records the cleanup", async () => {
+    const id = await shift();
+    const rows = [
+      [uid(), "2026-01-02T23:59:59.999999+03:00"],
+      [uid(), "2026-01-03T00:00:00+03:00"],
+    ];
+    for (const [logId, at] of rows)
+      await db.query("INSERT INTO audit_logs(id,actor_id,action,entity,created_at) VALUES($1,$2,'Проверка границы','maintenance',$3)", [logId, ids[0], at]);
+    const response = await call(admin, "DELETE", "/audit-logs", { through: "2026-01-02", reason: "Очистка старых записей" });
+    expect(response.statusCode, response.body).toBe(200);
+    expect(response.json()).toMatchObject({ deleted: 1, through: "2026-01-02" });
+    expect(await db.query("SELECT id FROM audit_logs WHERE id=$1", [rows[0][0]])).toHaveLength(0);
+    expect(await db.query("SELECT id FROM audit_logs WHERE id=$1", [rows[1][0]])).toHaveLength(1);
+    expect((await call(admin, "GET", `/shifts/${id}`)).statusCode).toBe(200);
+    expect((await call(admin, "GET", "/employees")).json()).toHaveLength(4);
+    const log = (await db.query("SELECT actor_id,reason,before_value FROM audit_logs WHERE action='Журнал действий очищен'"))[0];
+    expect(log).toMatchObject({ actor_id: ids[0], reason: "Очистка старых записей", before_value: { through: "2026-01-02", deleted_records: 1 } });
+  });
+  it("requires an administrator, a valid past date, a reason, and CSRF protection", async () => {
+    const body = { through: "2026-01-02", reason: "Очистка журнала" };
+    expect((await call(a, "DELETE", "/audit-logs", body)).statusCode).toBe(403);
+    expect((await call(admin, "DELETE", "/audit-logs", { ...body, through: "2026-02-30" })).statusCode).toBe(422);
+    expect((await call(admin, "DELETE", "/audit-logs", { ...body, through: "2099-01-01" })).json().code).toBe("FUTURE_DATE");
+    expect((await call(admin, "DELETE", "/audit-logs", { ...body, reason: " " })).statusCode).toBe(422);
+    const response = await app.inject({ method: "DELETE", url: "/api/audit-logs", headers: { cookie: admin.cookie }, payload: body });
+    expect(response.statusCode).toBe(403);
+    expect(await db.query("SELECT id FROM audit_logs WHERE action='Журнал действий очищен'")).toHaveLength(0);
+  });
+});
 describe("Server permissions and privacy", () => {
   it("serves all administrative read models", async () => {
     for (const path of [

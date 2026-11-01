@@ -845,3 +845,59 @@ test("Tomorrow includes the next month when the current calendar grid ends today
   await expect(tomorrow).toContainText("1смена");
   await expect(tomorrow).toContainText("08:00–12:00");
 });
+test("an admin can cancel or confirm audit cleanup without changing shifts", async ({ page }) => {
+  await page.context().addCookies([{ name: "rcs_session", value: "calendar-ui-test-session", url: "http://127.0.0.1:3181", httpOnly: true, sameSite: "Strict" }]);
+  await page.goto("/#audit");
+  const before = (await (await page.request.get("/api/audit-logs")).json()).map((row: any) => row.id);
+  await page.getByRole("button", { name: "Очистить журнал", exact: true }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText("Сотрудники, смены и начисления сохранятся");
+  await dialog.getByRole("button", { name: "Отмена", exact: true }).click();
+  expect((await (await page.request.get("/api/audit-logs")).json()).map((row: any) => row.id)).toEqual(before);
+  const me = await (await page.request.get("/api/auth/me")).json();
+  const date = me.server_now.slice(0, 10);
+  const url = `/api/schedule?from=${date}&to=${date}`;
+  const shifts = await (await page.request.get(url)).json();
+  await page.getByRole("button", { name: "Очистить журнал", exact: true }).click();
+  await dialog.getByLabel("Причина очистки", { exact: true }).fill("Очистка тестового журнала");
+  await dialog.getByRole("button", { name: "Удалить записи", exact: true }).click();
+  await expect(page.getByRole("status")).toContainText("Журнал очищен");
+  await expect(page.locator("main table tbody tr")).toHaveCount(1);
+  await expect(page.locator("main table tbody")).toContainText("Журнал действий очищен");
+  expect(await (await page.request.get(url)).json()).toEqual(shifts);
+});
+test("schedule grid rows stay aligned with multiple and cancelled shifts in light and dark themes", async ({ page }) => {
+  await page.context().addCookies([{ name: "rcs_session", value: "calendar-ui-test-session", url: "http://127.0.0.1:3181", httpOnly: true, sameSite: "Strict" }]);
+  const team = await (await page.request.get("/api/team")).json();
+  const me = await (await page.request.get("/api/auth/me")).json();
+  const date = me.server_now.slice(0, 10);
+  await page.route("**/api/schedule?*", (route) => route.fulfill({ json: [
+    ...[0, 1, 2].map((i) => ({ id: `grid-${i}`, user_id: team[0].id, user_name: team[0].name, date, start_time: `${8 + i * 2}:00`, end_time: `${10 + i * 2}:00`, type_name: "Проверка границ", status: i === 0 ? "cancelled" : "confirmed" })),
+    { id: "grid-vacant", user_id: null, user_name: null, date, start_time: "08:00", end_time: "15:00", type_name: "Без сотрудника", status: "cancelled" },
+  ] }));
+  await page.goto("/#schedule");
+  await expect(page.locator(".shift-chip.cancelled")).toHaveCount(2);
+  for (const width of [1280, 390]) {
+    await page.setViewportSize({ width, height: 900 });
+    for (const theme of ["light", "dark"]) {
+      await page.evaluate((value) => { document.documentElement.dataset.theme = value; }, theme);
+      for (const mode of ["День", "Неделя"]) {
+        await page.getByRole("button", { name: mode, exact: true }).click();
+        const rows = await page.locator(".schedule-table tbody tr").evaluateAll((items) => items.map((row) => [...row.children].map((cell) => {
+          const box = cell.getBoundingClientRect();
+          return { top: box.top, bottom: box.bottom, height: box.height };
+        })));
+        expect(rows.length).toBeGreaterThan(2);
+        for (let i = 0; i < rows.length; i++) {
+          for (const cell of rows[i]) {
+            expect(Math.abs(cell.top - rows[i][0].top), `${width}/${theme}/${mode}: row ${i} top`).toBeLessThan(1);
+            expect(Math.abs(cell.bottom - rows[i][0].bottom), `${width}/${theme}/${mode}: row ${i} bottom`).toBeLessThan(1);
+          }
+          if (i > 0) expect(Math.abs(rows[i][0].top - rows[i - 1][0].bottom)).toBeLessThan(1);
+        }
+        if (width === 390 && theme === "dark" && mode === "День")
+          await page.screenshot({ path: ".data/qa/schedule-grid-aligned.png", fullPage: true });
+      }
+    }
+  }
+});

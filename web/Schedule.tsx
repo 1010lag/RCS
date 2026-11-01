@@ -235,7 +235,8 @@ export function Schedule({
             <tbody>
               {staff.map((u) => (
                 <tr key={u.id}>
-                  <th className="person-cell">
+                  <th className="person-cell" scope="row">
+                    <div className="person-content">
                     <Avatar name={u.name} src={u.avatar_url} />
                     <span>
                       <strong>{u.name}</strong>
@@ -251,6 +252,7 @@ export function Schedule({
                         {plural(source.filter((s) => s.user_id === u.id && visibleDays.includes(s.date)).length, "смена", "смены", "смен")} на период
                       </small>
                     </span>
+                    </div>
                   </th>
                   {visibleDays.map((day) => (
                     <td
@@ -280,12 +282,14 @@ export function Schedule({
                 (s) => !s.user_id && visibleDays.includes(s.date),
               ) && (
                 <tr>
-                  <th className="person-cell">
+                  <th className="person-cell" scope="row">
+                    <div className="person-content">
                     <span className="vacant-icon">?</span>
                     <span>
                       <strong>Не назначены</strong>
                       <small>Нужен сотрудник</small>
                     </span>
+                    </div>
                   </th>
                   {visibleDays.map((day) => (
                     <td key={day}>

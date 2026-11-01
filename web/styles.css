@@ -878,31 +878,28 @@ table tbody tr:last-child td {
   margin-left: 6px;
 }
 .schedule-table .person-cell {
-  display: flex;
-  align-items: center;
-  gap: 10px;
+  display: table-cell;
+  vertical-align: middle;
   height: 84px;
-  border-right: 0;
   padding-left: 23px;
-  position: relative;
   font-weight: 600;
   background: var(--surface, white);
 }
-.person-cell:after {
-  position: absolute;
-  content: "";
-  right: 0;
-  top: 0;
-  bottom: 0;
-  border-right: 1px solid var(--stroke, #f0f0f2);
+.person-content {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
 }
+.schedule-table tbody tr:last-child th { border-bottom: 0; }
 .person-cell .avatar {
   width: 30px;
   height: 30px;
   font-size: 9px;
 }
-.person-cell > span:nth-child(2) {
+.person-content > span:last-child {
   overflow: hidden;
+  min-width: 0;
 }
 .person-cell strong {
   font-size: 10px;

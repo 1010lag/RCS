@@ -120,6 +120,7 @@ type Modal =
   | { kind: "reason"; title: string; action: (reason: string) => Promise<any> }
   | { kind: "adjust"; shift: Shift }
   | { kind: "message" }
+  | { kind: "clearAudit" }
   | { kind: "publish"; shift: Shift }
   | { kind: "detail"; shift: Shift };
 const titles: Record<View, string> = {
@@ -1460,7 +1461,12 @@ export function App() {
                 <section className="panel">
                   <div className="section-title padded">
                     <h2>Последние 100 действий</h2>
-                    <span className="tag neutral">Europe/Minsk</span>
+                    <div className="inline-actions">
+                      <span className="tag neutral">Europe/Minsk</span>
+                      <button className="btn" disabled={offline || busy} onClick={() => setModal({ kind: "clearAudit" })}>
+                        <Trash2 size={15} />Очистить журнал
+                      </button>
+                    </div>
                   </div>
                   <div className="table-scroll">
                     <table>
@@ -2742,6 +2748,23 @@ function ModalDialog({
             <Send size={16} />
             Отправить
           </button>
+        </div>
+      </Form>
+    );
+  }
+  if (modal.kind === "clearAudit" && admin) {
+    title = "Очистить журнал действий?";
+    body = (
+      <Form onSubmit={(body) => act(() => api("/audit-logs", "DELETE", { through: body.through, reason: body.reason }), "Журнал очищен")}>
+        <p>Записи по выбранную дату включительно будут удалены без возможности восстановления в приложении.</p>
+        <p className="muted small">Сотрудники, смены и начисления сохранятся. В журнале останется новая запись об очистке с вашим именем, датой и причиной.</p>
+        <Field label="Удалить записи по дату включительно" hint="Граница дня определяется по времени Минска.">
+          <input name="through" type="date" defaultValue={minskDate(now)} max={minskDate(now)} required />
+        </Field>
+        <Field label="Причина очистки"><input name="reason" required minLength={3} maxLength={1000} placeholder="Например, удаление старых записей" /></Field>
+        <div className="modal-footer">
+          <button className="btn" type="button" onClick={close} disabled={busy}>Отмена</button>
+          <button className="btn primary" disabled={busy || offline}>{busy ? "Удаляем…" : "Удалить записи"}</button>
         </div>
       </Form>
     );

@@ -1529,6 +1529,20 @@ export async function createApp(
     },
     true,
   );
+  route("DELETE", "/audit-logs", (req) => db.tx(async (sql) => {
+    const body = reasonSchema.extend({ through: z.string() }).parse(req.body);
+    const midnight = dateTime(body.through, "00:00");
+    if (body.through > localDate(await time(sql)))
+      fail("FUTURE_DATE", "Выберите сегодняшнюю или прошедшую дату");
+    const cutoff = new Date(Date.parse(midnight) + 86400000).toISOString();
+    const removed = (await sql.query(
+      "WITH removed AS (DELETE FROM audit_logs WHERE created_at<$1 RETURNING id) SELECT count(*)::integer AS count FROM removed",
+      [cutoff],
+    ))[0].count;
+    await audit(sql, req.user.id, "Журнал действий очищен", "maintenance", null,
+      { through: body.through, deleted_records: removed }, null, body.reason);
+    return { deleted: removed, through: body.through };
+  }), true);
   const streams = new StreamHub(db);
   route("GET", "/events", async (req, reply) => {
     streams.assertCapacity(req.user.id);
