@@ -1301,6 +1301,7 @@ export function App() {
                 <>
                   <div className="panel payroll-summary">
                     <MonthPager anchor={anchor} setAnchor={setAnchor} />
+                    {!isAdmin && <>
                     <div className="payroll-numbers">
                       <div>
                         <span>Отработано</span>
@@ -1322,11 +1323,12 @@ export function App() {
                     <p className="muted">
                       Внутренний информационный расчёт. Перерывы не вычитаются.
                     </p>
+                    </>}
                   </div>
-                  {monthPayroll.length > 0 && <>
-                    {isAdmin && <PayrollTotals title="Итоги по сотрудникам" rows={monthPayroll} group="employee" />}
-                    <PayrollTotals title="Итоги по неделям" rows={monthPayroll} group="week" />
-                  </>}
+                  {isAdmin ? (
+                    <PayrollTotals title="Итоги по сотрудникам" rows={monthPayroll} group="employee" />
+                  ) : <>
+                  {monthPayroll.length > 0 && <PayrollTotals title="Итоги по неделям" rows={monthPayroll} group="week" />}
                   <section className="panel">
                     <div className="section-title padded">
                       <h2>Начисления по дням</h2>
@@ -1384,6 +1386,7 @@ export function App() {
                       />
                     )}
                   </section>
+                  </>}
                 </>
               )}
               {view === "notifications" && (
@@ -1850,7 +1853,36 @@ function PayrollTotals({ title, rows, group }: { title: string; rows: PayrollRow
     current.plannedAmount += Number(row.planned_amount);
     totals.set(key, current);
   }
-  return <section className="panel payroll-totals"><div className="section-title padded"><h2>{title}</h2>{group === "week" && <span className="muted small">В пределах выбранного месяца</span>}</div><div className="table-scroll"><table><thead><tr><th>{group === "employee" ? "Сотрудник" : "Неделя"}</th><th>Отработано</th><th>Начислено</th><th>План, ч</th><th>Ожидается</th></tr></thead><tbody>{[...totals.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([key, total]) => <tr key={key}><td>{total.name}</td><td>{hours(total.minutes)} ч</td><td><strong>{currency(total.amount)}</strong></td><td>{hours(total.plannedMinutes)}</td><td>{currency(total.plannedAmount)}</td></tr>)}</tbody></table></div></section>;
+  const employee = group === "employee";
+  return (
+    <section className="panel payroll-totals">
+      <div className="section-title padded">
+        <h2>{title}</h2>
+        {!employee && <span className="muted small">В пределах выбранного месяца</span>}
+      </div>
+      <div className="table-scroll">
+        <table>
+          <thead><tr>
+            <th>{employee ? "Сотрудник" : "Неделя"}</th>
+            <th>{employee ? "Часы" : "Отработано"}</th>
+            <th>{employee ? "Зарплата" : "Начислено"}</th>
+            {!employee && <><th>План, ч</th><th>Ожидается</th></>}
+          </tr></thead>
+          <tbody>
+            {[...totals.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([key, total]) => (
+              <tr key={key}>
+                <td>{total.name}</td>
+                <td>{hours(total.minutes)} ч</td>
+                <td><strong>{currency(total.amount)}</strong></td>
+                {!employee && <><td>{hours(total.plannedMinutes)}</td><td>{currency(total.plannedAmount)}</td></>}
+              </tr>
+            ))}
+            {!totals.size && <tr><td colSpan={employee ? 3 : 5} className="muted">За выбранный месяц начислений нет</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
 }
 function MonthPager({
   anchor,

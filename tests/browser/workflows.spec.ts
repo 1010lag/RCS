@@ -795,7 +795,7 @@ test("month overflow labels fit and unassigned and cancelled shifts have clear s
   await expect(cell.locator(".shift-chip.cancelled")).toHaveCount(1);
   await page.screenshot({ path: ".data/qa/regression-month-more.png", fullPage: true });
 });
-test("payroll totals sum employees and weeks", async ({ page }) => {
+test("admin payroll shows only employee monthly hours and salary", async ({ page }) => {
   await regressionSession(page);
   await page.route("**/api/payroll?*", async (route) => {
     // Use dates inside the selected month, independent of its surrounding grid.
@@ -809,9 +809,14 @@ test("payroll totals sum employees and weeks", async ({ page }) => {
   });
   await page.goto("/#payroll");
   const employeeTable = page.locator(".payroll-totals").filter({ hasText: "Итоги по сотрудникам" });
-  await expect(employeeTable.locator("tbody tr").filter({ hasText: "Первый" })).toContainText("50,30 Br");
-  const weeks = page.locator(".payroll-totals").filter({ hasText: "Итоги по неделям" });
-  await expect(weeks.locator("tbody")).toContainText("60,30 Br");
+  await expect(employeeTable.locator("thead th")).toHaveText(["Сотрудник", "Часы", "Зарплата"]);
+  await expect(employeeTable.locator("tbody tr")).toHaveCount(2);
+  await expect(employeeTable.locator("tbody tr").filter({ hasText: "Первый" }).locator("td")).toHaveText(["Первый", "2,5 ч", "50,30 Br"]);
+  await expect(page.locator("main table")).toHaveCount(1);
+  await expect(page.locator(".payroll-numbers")).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Итоги по неделям" })).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Начисления по дням" })).toHaveCount(0);
+  await expect(page.locator(".month-pager")).toBeVisible();
 });
 test("signing in as a different account starts at Today with the personal cards", async ({ page }) => {
   await regressionSession(page);
