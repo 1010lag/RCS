@@ -3,6 +3,8 @@ import type { Database } from "./db";
 import { audit, notify, admins, uid } from "./domain";
 export async function tick(db: Database, push: PushGateway = firebasePush) {
   await db.tx(async (sql) => {
+    await sql.query("DELETE FROM sessions WHERE expires_at<=clock_timestamp()");
+    await sql.query("DELETE FROM request_limits WHERE resets_at<clock_timestamp()-interval '1 day'");
     const finished = await sql.query(
       "UPDATE shifts SET status='worked',version=version+1 WHERE status IN ('planned','confirmed') AND end_at<=clock_timestamp() RETURNING id,user_id,date::text",
     );
@@ -80,9 +82,10 @@ export async function tick(db: Database, push: PushGateway = firebasePush) {
   if (!(await push.settings()).ready) return;
   // One API process owns delivery in the initial deployment. DB events remain durable.
   const deliveries = await db.query(
-    "SELECT d.id,d.attempts,p.token,p.platform,n.id AS notification_id,n.title,n.body,n.link,n.dedup_key,n.user_id FROM deliveries d JOIN notifications n ON n.id=d.notification_id JOIN push_devices p ON p.id=d.device_id AND p.user_id=n.user_id JOIN users u ON u.id=n.user_id AND u.active LEFT JOIN preferences pref ON pref.user_id=n.user_id WHERE d.sent_at IS NULL AND d.attempts<8 AND d.next_attempt<=clock_timestamp() AND COALESCE((to_jsonb(pref)->>n.category)::boolean,true) ORDER BY d.next_attempt LIMIT 20",
+    "SELECT d.id,d.device_id,d.attempts,p.token,p.platform,n.id AS notification_id,n.title,n.body,n.link,n.dedup_key,n.user_id FROM deliveries d JOIN notifications n ON n.id=d.notification_id JOIN push_devices p ON p.id=d.device_id AND p.user_id=n.user_id JOIN sessions sess ON sess.id=p.session_id AND sess.user_id=p.user_id AND sess.expires_at>clock_timestamp() JOIN users u ON u.id=n.user_id AND u.active LEFT JOIN preferences pref ON pref.user_id=n.user_id WHERE d.sent_at IS NULL AND d.attempts<8 AND d.next_attempt<=clock_timestamp() AND COALESCE((to_jsonb(pref)->>n.category)::boolean,true) ORDER BY d.next_attempt LIMIT 20",
   );
   for (const d of deliveries) {
+    if (!(await db.query("SELECT 1 FROM push_devices p JOIN sessions s ON s.id=p.session_id AND s.user_id=p.user_id JOIN users u ON u.id=p.user_id WHERE p.id=$1 AND p.user_id=$2 AND s.expires_at>clock_timestamp() AND u.active", [d.device_id, d.user_id])).length) continue;
     if (d.dedup_key?.startsWith("reminder:")) {
       const [, id, version, interval] = d.dedup_key.split(":");
       const current = (

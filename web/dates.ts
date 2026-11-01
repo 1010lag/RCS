@@ -10,6 +10,10 @@ export const addDays = (date: string, n: number) =>
 export const weekStart = (date: string) =>
   addDays(date, -((new Date(date).getUTCDay() + 6) % 7));
 export const monthStart = (date: string) => date.slice(0, 7) + "-01";
+export const monthGridRange = (date: string) => {
+  const start = weekStart(monthStart(date));
+  return [start, addDays(weekStart(monthEnd(date)), 6)] as const;
+};
 export const monthEnd = (date: string) => {
   const d = new Date(date);
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0))

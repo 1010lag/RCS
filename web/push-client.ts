@@ -1,4 +1,19 @@
 import { api } from "./api";
+import { nativeApp } from "./runtime";
+export async function clearPushRegistration(config: any) {
+  localStorage.removeItem("rcs-push-device");
+  localStorage.removeItem("rcs-push-user");
+  try {
+    if (nativeApp && import.meta.env.VITE_NATIVE_FIREBASE_CONFIGURED === "true") {
+      const { PushNotifications } = await import("@capacitor/push-notifications");
+      await PushNotifications.unregister();
+    } else if (!nativeApp && config?.push_config?.projectId) {
+      const [{ getApps }, { getMessaging, deleteToken }] = await Promise.all([import("@firebase/app"), import("@firebase/messaging")]);
+      const firebase = getApps().find((app) => app.name === `rcs-web-push-${config.push_config.projectId}`);
+      if (firebase) await deleteToken(getMessaging(firebase));
+    }
+  } catch { /* The server also revokes every device bound to the expired session. */ }
+}
 export async function registerPushDevice(config: any, userId: string) {
   if (!config?.push_ready || Notification.permission !== "granted") return null;
   const [{ getApps, initializeApp }, { getMessaging, getToken, isSupported }] =

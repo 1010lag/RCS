@@ -54,6 +54,25 @@ try {
   await navigate("График", "График смен");
   await expect(page.getByRole("heading", { name: "График смен", exact: true })).toBeVisible();
   record("Schedule opens");
+  await page.getByRole("button", { name: "Месяц", exact: true }).click();
+  const month = await page.locator(".month-grid").evaluate((grid) => {
+    const dates = [...grid.querySelectorAll(".month-cell")].map((cell) => cell.dataset.date);
+    const boxes = [...grid.children].map((cell) => {
+      const box = cell.getBoundingClientRect();
+      return { x: box.x, y: box.y, width: box.width, height: box.height };
+    });
+    return { dates, boxes, blankButtons: grid.querySelectorAll(".month-placeholder button").length };
+  });
+  if (month.dates.length < 28 || month.dates.some((date) => date.slice(0, 7) !== month.dates[0].slice(0, 7))) throw new Error("Calendar contains dates outside its month.");
+  if (month.boxes.length % 7 || month.blankButtons) throw new Error("Month grid is incomplete or has interactive blank cells.");
+  for (let i = 0; i < month.boxes.length; i++) {
+    const cell = month.boxes[i], firstInRow = month.boxes[Math.floor(i / 7) * 7];
+    if (Math.abs(cell.x - month.boxes[i % 7].x) > 1 || Math.abs(cell.y - firstInRow.y) > 1 || Math.abs(cell.height - firstInRow.height) > 1) throw new Error("Month calendar has uneven rows or columns.");
+  }
+  await mkdir(".data/qa/phone", { recursive: true });
+  await page.screenshot({ path: ".data/qa/phone/calendar-month.png", timeout: 10000 });
+  record("Month is a complete rectangular grid with only selected-month dates");
+  await page.getByRole("button", { name: "День", exact: true }).click();
   await navigate("Профиль", "Настройки");
   await expect(page.getByRole("heading", { name: "Профиль", exact: true }).first()).toBeVisible();
   record("Profile opens");

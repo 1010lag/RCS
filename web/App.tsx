@@ -67,6 +67,7 @@ import {
   addDays,
   weekStart,
   monthStart,
+  monthGridRange,
   monthEnd,
   moveMonth,
   label,
@@ -80,7 +81,7 @@ import { CoffeeArt } from "./CoffeeArt";
 import { ThemeSettings } from "./ThemeSettings";
 import { AvatarSettings } from "./AvatarSettings";
 import { PushControls } from "./PushControls";
-import { registerPushDevice } from "./push-client";
+import { registerPushDevice, clearPushRegistration } from "./push-client";
 import { nativeApp, serverBase } from "./runtime";
 type View =
   | "home"
@@ -106,6 +107,8 @@ type Modal =
   | { kind: "shift"; shift?: Shift; date?: string; userId?: string }
   | { kind: "employee"; employee?: User }
   | { kind: "account" }
+  | { kind: "name" }
+  | { kind: "adjustmentCredit"; adjustment: { id: string; user_name: string } }
   | { kind: "rate"; employee: User }
   | { kind: "deleteEmployee"; employee: User }
   | { kind: "deleteType"; type: ShiftType }
@@ -252,8 +255,7 @@ export function App() {
     const id = user.id,
       seq = ++requestSeq.current;
     setLoading(true);
-    const from = addDays(monthStart(anchor), -7),
-      to = addDays(monthEnd(anchor), 7),
+    const [from, to] = monthGridRange(anchor),
       range = `from=${from}&to=${to}`;
     try {
       const [shifts, mine, team, types, listings, notices, payroll, me] =
@@ -389,6 +391,7 @@ export function App() {
     }
   }, [user?.id, user?.must_change_password, config?.push_ready, offline]);
   async function forget() {
+    void clearPushRegistration(config);
     activeUser.current = null;
     requestSeq.current++;
     setUser(null);
@@ -404,6 +407,11 @@ export function App() {
     await cacheClear().catch(() => {});
     navigator.serviceWorker?.controller?.postMessage({ type: "CLEAR_PRIVATE" });
   }
+  useEffect(() => {
+    const revoked = () => { void clearPushRegistration(config); };
+    window.addEventListener("rcs-push-revoked", revoked);
+    return () => window.removeEventListener("rcs-push-revoked", revoked);
+  }, [config]);
   async function logout() {
     try {
       const deviceId = localStorage.getItem("rcs-push-device");
@@ -945,15 +953,6 @@ export function App() {
                   create={(date, userId) =>
                     setModal({ kind: "shift", date, userId })
                   }
-                  repeat={(from) =>
-                    setModal({
-                      kind: "reason",
-                      title:
-                        "Повторить неделю: введите дату понедельника (ГГГГ-ММ-ДД)",
-                      action: (to) =>
-                        api("/schedule/repeat-week", "POST", { from, to }),
-                    })
-                  }
                 />
               )}
               {view === "exchange" && (
@@ -1142,7 +1141,7 @@ export function App() {
                           <strong>
                             {e.rate
                               ? `${currency(e.rate)} / ${e.pay_type === "hourly" ? "час" : "смену"}`
-                              : "Ставка по типу смены"}
+                              : e.pay_type === "hourly" ? "Ставка в час не задана" : "Ставка по типу смены"}
                           </strong>
                         </div>
                         <button
@@ -1204,10 +1203,7 @@ export function App() {
                       <div className="type-hours">
                         {t.start_time.slice(0, 5)} — {t.end_time.slice(0, 5)}
                       </div>
-                      <strong>
-                        {currency(t.rate)} /{" "}
-                        {t.pay_type === "hourly" ? "час" : "смену"}
-                      </strong>
+                      {t.pay_type === "shift" && <strong>{currency(t.rate)} / смену</strong>}
                       <p className="muted">
                         {t.allow_exchange
                           ? "Можно передавать через биржу"
@@ -1434,6 +1430,7 @@ export function App() {
                       {isAdmin ? "Администратор" : "Бариста"}
                     </span>
                     <p>{user.phone}</p>
+                    <button className="btn full" disabled={offline || busy} onClick={() => setModal({ kind: "name" })}><Users size={16} />Изменить имя и фамилию</button>
                     <AvatarSettings user={user} offline={offline} saved={(updated) => {
                       setUser(updated);
                       sessionStorage.setItem("rcs-user", JSON.stringify(updated));
@@ -1491,6 +1488,7 @@ export function App() {
                         </label>
                       ))}
                     <PushControls
+                      key={user.version}
                       userId={user.id}
                       admin={isAdmin}
                       config={config}
@@ -1945,6 +1943,8 @@ function ModalDialog({
   setModal: (m: Modal | null) => void;
 }) {
   const ref = useRef<HTMLDialogElement>(null),
+    [typePayType, setTypePayType] = useState<"hourly" | "shift">(modal.kind === "type" ? modal.type?.pay_type ?? "hourly" : "hourly"),
+    [employeeRole, setEmployeeRole] = useState<"admin" | "barista">(modal.kind === "employee" ? modal.employee?.role ?? "barista" : "barista"),
     [adjustments, setAdjustments] = useState<any[]>([]),
     [selectedType, setSelectedType] = useState(
       modal.kind === "shift"
@@ -2134,15 +2134,35 @@ function ModalDialog({
       </Form>
     );
   }
+  if (modal.kind === "adjustmentCredit") {
+    title = "Уточнить старую корректировку";
+    body = <Form onSubmit={(b) => act(() => api(`/adjustments/${modal.adjustment.id}/credit`, "PATCH", { amount: b.amount, reason: b.reason }), "Сумма персональной корректировки уточнена")}>
+      <p>Получатель: <strong>{modal.adjustment.user_name}</strong>.</p>
+      <p className="muted small">Укажите денежный итог старой корректировки, включая изменение минут. Сотрудник-получатель останется прежним.</p>
+      <Field label="Сумма корректировки, Br"><input name="amount" type="number" step="0.01" required /></Field>
+      <Field label="Причина уточнения"><input name="reason" minLength={3} maxLength={1000} required /></Field>
+      <div className="modal-footer"><button className="btn" type="button" onClick={close}>Отмена</button><button className="btn primary" disabled={busy || offline}>Сохранить</button></div>
+    </Form>;
+  }
+  if (modal.kind === "name") {
+    title = "Имя и фамилия";
+    body = <Form onSubmit={(b) => act(() => api("/me/name", "PATCH", { name: b.name, version: user.version }), "Имя и фамилия обновлены")}>
+      <Field label="Имя и фамилия"><input name="name" defaultValue={user.name} autoComplete="name" required maxLength={200} /></Field>
+      <p className="muted small">Новое имя будет видно команде в графике смен.</p>
+      <div className="modal-footer"><button className="btn" type="button" onClick={close}>Отмена</button><button className="btn primary" disabled={busy || offline}>Сохранить</button></div>
+    </Form>;
+  }
   if (modal.kind === "account") {
     title = "Телефон и пароль администратора";
     body = <Form onSubmit={(b) => act(() => api(`/employees/${user.id}`, "PATCH", {
       name: user.name, phone: b.phone, rate: user.rate, pay_type: user.pay_type,
       active: true, version: user.version, reason: "Изменение собственных данных администратора",
       ...(b.password ? { password: b.password } : {}),
+      current_password: b.current_password,
     }), "Данные для входа обновлены")}>
       <Field label="Номер телефона"><input name="phone" type="tel" autoComplete="tel" defaultValue={user.phone} required /></Field>
       <Field label="Новый пароль" hint="Не менее 10 символов. Оставьте пустым, чтобы сохранить текущий пароль."><input name="password" type="password" autoComplete="new-password" minLength={10} maxLength={128} /></Field>
+      <Field label="Текущий пароль"><input name="current_password" type="password" autoComplete="current-password" maxLength={128} required /></Field>
       <p className="muted small">После смены пароля остальные сеансы будут завершены. Следующий вход — с новым телефоном и паролем.</p>
       <div className="modal-footer"><button className="btn" type="button" onClick={close}>Отмена</button><button className="btn primary" disabled={busy || offline}>Сохранить</button></div>
     </Form>;
@@ -2167,7 +2187,7 @@ function ModalDialog({
       )}>
         <p><strong>{item.name}</strong> будет перемещён в архив.</p>
         <p className="muted small">{isEmployee
-          ? "Доступ сотрудника будет закрыт. Его смены исчезнут из общего графика, текущие и будущие смены отменятся, объявления на бирже закроются. История отработанных смен и начислений сохранится."
+          ? "Доступ сотрудника будет закрыт. Текущая смена будет завершена в момент удаления, будущие отменятся, объявления на бирже закроются. История отработанных смен и начислений сохранится в графике и отчётах."
           : "Назначенные смены и их оплата сохранятся. Тип исчезнет из выбора для новых смен, а его открытые объявления на бирже будут закрыты."}</p>
         {isEmployee && <Field label="Причина удаления"><input name="reason" required minLength={3} maxLength={1000} placeholder="Например, сотрудник уволился" /></Field>}
         <div className="modal-footer">
@@ -2271,8 +2291,9 @@ function ModalDialog({
                         version: e.version,
                         reason: b.reason,
                         ...(b.password ? { password: b.password } : {}),
+                        ...(b.current_password ? { current_password: b.current_password } : {}),
                       }
-                    : { password: b.password, role: b.role }),
+                    : { password: b.password, role: b.role, ...(b.current_password ? { current_password: b.current_password } : {}) }),
                 },
               ),
             "Профиль сохранён",
@@ -2287,6 +2308,7 @@ function ModalDialog({
             name="phone"
             type="tel"
             defaultValue={e?.phone}
+            readOnly={e?.role === "admin" && e.id !== user.id}
             placeholder="+375291234567"
             required
           />
@@ -2294,7 +2316,7 @@ function ModalDialog({
         {!e && (
           <>
             <Field label="Роль">
-              <select name="role">
+              <select name="role" value={employeeRole} onChange={(event) => setEmployeeRole(event.target.value as "admin" | "barista")}>
                 <option value="barista">Бариста</option>
                 <option value="admin">Администратор</option>
               </select>
@@ -2313,7 +2335,9 @@ function ModalDialog({
             </Field>
           </>
         )}
-        {e && <Field label="Новый пароль" hint={e.id === user.id ? "Оставьте пустым, чтобы не менять пароль." : "Оставьте пустым, чтобы не менять пароль. После сброса сотрудник задаст свой пароль при входе."}><input name="password" type="password" minLength={10} maxLength={128} autoComplete="new-password" /></Field>}
+        {e && (e.role !== "admin" || e.id === user.id) && <Field label="Новый пароль" hint={e.id === user.id ? "Оставьте пустым, чтобы не менять пароль." : "Оставьте пустым, чтобы не менять пароль. После сброса сотрудник задаст свой пароль при входе."}><input name="password" type="password" minLength={10} maxLength={128} autoComplete="new-password" /></Field>}
+        {((!e && employeeRole === "admin") || (e && (e.role !== "admin" || e.id === user.id))) && <Field label="Текущий пароль администратора" hint="Обязателен при смене телефона, пароля или создании нового администратора."><input name="current_password" type="password" autoComplete="current-password" maxLength={128} required={!e && employeeRole === "admin"} /></Field>}
+        {e?.role === "admin" && e.id !== user.id && <p className="muted small">Телефон и пароль другого администратора изменяет только владелец аккаунта в своём профиле.</p>}
         <div className="form-row">
           <Field label="Индивидуальная ставка, Br">
             <input
@@ -2322,7 +2346,7 @@ function ModalDialog({
               min="0"
               step=".01"
               defaultValue={e?.rate ?? ""}
-              placeholder="По типу смены"
+              placeholder="Укажите ставку сотрудника"
             />
           </Field>
           <Field label="Оплата">
@@ -2342,7 +2366,7 @@ function ModalDialog({
               <input name="reason" required minLength={3} />
             </Field>
             <p className="muted small">
-              При отключении сотрудника его текущие и будущие смены будут отменены и убраны из графика.
+              При отключении сотрудника текущая смена будет завершена в момент удаления, будущие отменятся. История отработанных смен сохранится.
             </p>
           </>
         )}
@@ -2373,7 +2397,7 @@ function ModalDialog({
                   start_time: b.start_time,
                   end_time: b.end_time,
                   pay_type: b.pay_type,
-                  rate: b.rate,
+                  ...(b.pay_type === "shift" ? { rate: b.rate } : {}),
                   active: b.active === "on",
                   allow_exchange: b.allow_exchange === "on",
                   ...(t ? { version: t.version } : {}),
@@ -2411,21 +2435,21 @@ function ModalDialog({
         </div>
         <div className="form-row">
           <Field label="Модель оплаты">
-            <select name="pay_type" defaultValue={t?.pay_type ?? "hourly"}>
-              <option value="hourly">Почасовая</option>
+            <select name="pay_type" value={typePayType} onChange={(event) => setTypePayType(event.target.value as "hourly" | "shift")}>
+              <option value="hourly">По ставке сотрудника</option>
               <option value="shift">За смену</option>
             </select>
           </Field>
-          <Field label="Ставка, Br">
+          {typePayType === "shift" && <Field label="Оплата за смену, Br">
             <input
               name="rate"
               type="number"
               min="0"
               step=".01"
               required
-              defaultValue={t?.rate ?? "12.00"}
+              defaultValue={t?.pay_type === "shift" ? t.rate : ""}
             />
-          </Field>
+          </Field>}
         </div>
         <label className="checkbox-field">
           <input
@@ -2444,8 +2468,7 @@ function ModalDialog({
           Тип активен
         </label>
         <p className="muted small">
-          Изменения времени и ставки применяются к новым сменам. Сохранённые
-          назначения не переписываются.
+          {typePayType === "hourly" ? "Почасовая ставка задаётся у сотрудника в разделе «Команда». " : "Оплата за смену применяется к новым назначениям. "}Изменение типа не пересчитывает сохранённые смены.
         </p>
         <div className="modal-footer">
           <button className="btn" type="button" onClick={close}>
@@ -2714,6 +2737,8 @@ function ModalDialog({
                   {a.minutes} мин · {currency(a.amount)}
                 </strong>
                 <p>{a.reason}</p>
+                  <p className="muted small">Получатель: {a.user_name}</p>
+                  {admin && a.credit_amount === null && a.minutes !== 0 && a.user_id !== s.user_id && <button className="btn tiny" onClick={() => setModal({ kind: "adjustmentCredit", adjustment: a })}>Уточнить сумму</button>}
                 <small>
                   {a.author} · {stamp(a.created_at)}
                 </small>

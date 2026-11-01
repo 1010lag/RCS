@@ -72,3 +72,27 @@ CREATE INDEX IF NOT EXISTS shifts_user_date ON shifts(user_id,date);
 CREATE INDEX IF NOT EXISTS notifications_user ON notifications(user_id,created_at DESC);
 -- statement
 CREATE INDEX IF NOT EXISTS exchange_expiry ON exchange_listings(status,closes_at);
+-- statement
+CREATE TABLE IF NOT EXISTS request_limits (key text PRIMARY KEY,hits integer NOT NULL,resets_at timestamptz NOT NULL);
+-- statement
+CREATE INDEX IF NOT EXISTS request_limits_expiry ON request_limits(resets_at);
+-- statement
+ALTER TABLE push_devices ADD COLUMN IF NOT EXISTS session_id text REFERENCES sessions(id) ON DELETE CASCADE;
+-- statement
+DELETE FROM push_devices WHERE session_id IS NULL;
+-- statement
+ALTER TABLE push_devices ALTER COLUMN session_id SET NOT NULL;
+-- statement
+ALTER TABLE adjustments ADD COLUMN IF NOT EXISTS credit_amount numeric(12,2);
+-- statement
+WITH source AS (
+ SELECT a.id,a.minutes,a.amount,
+ SUM(a.minutes) OVER(PARTITION BY a.shift_id,a.user_id ORDER BY a.created_at,a.id) AS running_minutes,
+ EXTRACT(EPOCH FROM(s.end_at-s.start_at))/60 AS base_minutes,
+ COALESCE((SELECT l.old_rate FROM exchange_listings l WHERE l.shift_id=a.shift_id AND l.listed_by=a.user_id AND l.taken_at>=a.created_at AND l.old_rate IS NOT NULL ORDER BY l.taken_at LIMIT 1),CASE WHEN s.user_id=a.user_id THEN s.rate END) AS rate,
+ COALESCE((SELECT l.old_pay_type FROM exchange_listings l WHERE l.shift_id=a.shift_id AND l.listed_by=a.user_id AND l.taken_at>=a.created_at AND l.old_pay_type IS NOT NULL ORDER BY l.taken_at LIMIT 1),CASE WHEN s.user_id=a.user_id THEN s.pay_type END) AS pay_type
+ FROM adjustments a JOIN shifts s ON s.id=a.shift_id
+)
+UPDATE adjustments a SET credit_amount=CASE WHEN x.minutes=0 THEN x.amount WHEN x.pay_type='shift' THEN x.amount WHEN x.rate IS NOT NULL AND x.pay_type='hourly' THEN round((x.base_minutes+x.running_minutes)*x.rate/60,2)-round((x.base_minutes+x.running_minutes-x.minutes)*x.rate/60,2)+x.amount ELSE NULL END FROM source x WHERE a.id=x.id AND a.credit_amount IS NULL;
+-- statement
+CREATE INDEX IF NOT EXISTS adjustments_owner ON adjustments(shift_id,user_id);

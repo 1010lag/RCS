@@ -5,6 +5,9 @@ import { hash, verify } from "@node-rs/argon2";
 import { createHash, randomBytes } from "node:crypto";
 import { z, ZodError } from "zod";
 import { prepareAvatar } from "./avatar";
+import { budgetKey, consumeBudget, MemoryBudget, ResourceGate, trustedProxies } from "./security";
+import { StreamHub } from "./streams";
+import { payrollRows } from "./payroll";
 import type { Database, Sql } from "./db";
 import type { User } from "../shared/types";
 import { firebasePush, invalidPushToken, type PushGateway } from "./push";
@@ -20,9 +23,11 @@ import {
   notify,
   admins,
   now,
+  localDate,
   shiftForUpdate,
   expectVersion,
   assertExchange,
+  assertUnadjusted,
   closeListing,
   rateFor,
   shiftProjection,
@@ -35,6 +40,7 @@ declare module "fastify" {
   interface FastifyRequest {
     user: User;
     session: { id: string; csrf: string };
+    releaseCapacity: (() => void) | null;
   }
 }
 const digest = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -55,13 +61,14 @@ const userSchema = z.object({
     .string()
     .min(10, "Пароль должен содержать минимум 10 символов")
     .max(128),
+  current_password: z.string().max(128).optional(),
 });
 const typeSchema = z.object({
   name: text,
   start_time: z.string(),
   end_time: z.string(),
-  pay_type: z.enum(["hourly", "shift"]),
-  rate: z.string(),
+  pay_type: z.enum(["hourly", "shift"]).default("hourly"),
+  rate: z.string().optional(),
   allow_exchange: z.boolean().default(true),
   active: z.boolean().default(true),
 });
@@ -85,13 +92,30 @@ export async function createApp(
   options: { logger?: boolean; clock?: () => Date; push?: PushGateway } = {},
 ) {
   const push = options.push ?? firebasePush;
+  const cpu = new ResourceGate(2, 4), requests = new ResourceGate(48), usersBudget = new MemoryBudget();
+  const dummyPasswordHash = await hash(randomBytes(32).toString("hex"));
   const app = Fastify({
     logger: options.logger ?? false,
     bodyLimit: 65536,
-    trustProxy: process.env.NODE_ENV === "production",
+    trustProxy: trustedProxies(),
+    requestTimeout: 15000,
   });
   await app.register(cookie);
-  await app.register(rateLimit, { global: false });
+  // Phones in one coffee shop share an IP: 20 polling clients already use
+  // 600 revision requests/minute. Per-user and expensive-operation limits
+  // remain separate; static assets do not consume the API request budget.
+  await app.register(rateLimit, {
+    global: true, max: 1200, timeWindow: "1 minute", cache: 10000,
+    allowList: (req) => !req.url.startsWith("/api/"),
+  });
+  app.decorateRequest("releaseCapacity", null);
+  app.addHook("onRequest", async (req) => {
+    req.releaseCapacity = requests.enter();
+    req.raw.once("aborted", req.releaseCapacity);
+  });
+  app.addHook("onResponse", async (req) => req.releaseCapacity?.());
+  app.addHook("onError", async (req) => req.releaseCapacity?.());
+  app.addHook("onTimeout", async (req) => req.releaseCapacity?.());
   // Android's HTTP stack can label a bodyless POST as an empty HTML form.
   // Accept only the empty body; API data must still use the JSON parser.
   app.addContentTypeParser(
@@ -106,6 +130,8 @@ export async function createApp(
   app.decorateRequest("user", null as any);
   app.decorateRequest("session", null as any);
   app.setErrorHandler((error, req, reply) => {
+    if ((error as any).retryAfter) reply.header("Retry-After", String((error as any).retryAfter));
+    if ((error as any).code === "DB_BUSY") return reply.code(503).send({ code: "SERVER_BUSY", message: "Сервер занят. Попробуйте позже" });
     if (error instanceof Problem)
       return reply
         .code(error.status)
@@ -181,6 +207,7 @@ export async function createApp(
     if (!s) fail("UNAUTHORIZED", "Сессия истекла. Войдите снова", 401);
     req.user = publicUser(s);
     req.session = { id: s.session_id, csrf: s.csrf };
+    usersBudget.consume(req.user.id, 300, 60000);
     if (!["GET", "HEAD"].includes(req.method)) {
       originCheck(req);
       if (req.headers["x-csrf-token"] !== s.csrf)
@@ -209,33 +236,52 @@ export async function createApp(
     });
   }
   const time = async (sql: Sql) => (options.clock ? options.clock() : now(sql));
+  async function reauthenticate(sql: Sql, req: FastifyRequest, password?: string) {
+    if (!password) fail("REAUTH_REQUIRED", "Введите текущий пароль администратора", 403);
+    const actor = (await sql.query("SELECT password_hash FROM users WHERE id=$1 AND active FOR SHARE", [req.user.id]))[0];
+    if (!actor || !(await cpu.run(() => verify(actor.password_hash, password!)))) fail("REAUTH_FAILED", "Текущий пароль неверен", 403);
+  }
+  async function rotateSessions(sql: Sql, userId: string) {
+    const token = randomBytes(32).toString("hex"), csrf = randomBytes(24).toString("hex");
+    await sql.query("DELETE FROM sessions WHERE user_id=$1", [userId]);
+    await sql.query("INSERT INTO sessions(id,user_id,csrf,expires_at) VALUES($1,$2,$3,clock_timestamp()+interval '7 days')", [digest(token), userId, csrf]);
+    return { token, csrf };
+  }
+  function applySession(reply: FastifyReply, session: { token: string; csrf: string }) {
+    reply.header("X-CSRF-Token", session.csrf).setCookie("rcs_session", session.token, {
+      httpOnly: true, sameSite: "strict", secure: process.env.NODE_ENV === "production", path: "/", maxAge: 604800,
+    });
+  }
   const range = (req: FastifyRequest) => {
     const q = req.query as any;
+    const today = localDate(options.clock?.() ?? new Date());
     return period(
-      q.from ?? new Date().toISOString().slice(0, 10),
-      q.to ?? new Date().toISOString().slice(0, 10),
+      q.from ?? today,
+      q.to ?? today,
     );
   };
   app.get("/api/health", async () => ({ ok: true }));
   app.post(
     "/api/auth/login",
-    { config: { rateLimit: { max: 8, timeWindow: "1 minute" } } },
     async (req, reply) => {
       originCheck(req);
       const body = z
         .object({ phone: z.string(), password: z.string().max(128) })
         .parse(req.body);
+      const normalizedPhone = phone(body.phone);
+      await consumeBudget(db, budgetKey("login-ip", req.ip), 20, 60000);
+      const accountKey = budgetKey("login-account", normalizedPhone);
+      await consumeBudget(db, accountKey, 8, 15 * 60000);
       const u = (
         await db.query("SELECT * FROM users WHERE phone=$1 AND active", [
-          phone(body.phone),
+          normalizedPhone,
         ])
       )[0];
       // Hash once for a missing user as well, so login timing does not identify accounts.
-      const valid = u
-        ? await verify(u.password_hash, body.password)
-        : (await hash(body.password), false);
+      const valid = await cpu.run(() => verify(u?.password_hash ?? dummyPasswordHash, body.password));
       if (!u || !valid)
         fail("LOGIN_FAILED", "Неверный телефон или пароль", 401);
+      await db.query("DELETE FROM request_limits WHERE key=$1", [accountKey]);
       const token = randomBytes(32).toString("hex"),
         csrf = randomBytes(24).toString("hex");
       await db.query(
@@ -272,29 +318,29 @@ export async function createApp(
     reply.clearCookie("rcs_session", { path: "/" });
     return { ok: true };
   });
-  route("POST", "/auth/password", async (req) => {
+  route("POST", "/auth/password", async (req, reply) => {
     const b = z
       .object({ current: z.string(), password: z.string().min(10).max(128) })
       .parse(req.body);
+    await consumeBudget(db, budgetKey("password", req.user.id), 5, 15 * 60000);
     const u = (
       await db.query("SELECT password_hash FROM users WHERE id=$1", [
         req.user.id,
       ])
     )[0];
-    if (!(await verify(u.password_hash, b.current)))
+    if (!(await cpu.run(() => verify(u.password_hash, b.current))))
       fail("LOGIN_FAILED", "Текущий пароль неверен", 403);
-    const hashed = await hash(b.password);
-    await db.tx(async (sql) => {
+    const hashed = await cpu.run(() => hash(b.password));
+    const session = await db.tx(async (sql) => {
       await sql.query(
         "UPDATE users SET password_hash=$1,must_change_password=false,version=version+1 WHERE id=$2",
         [hashed, req.user.id],
       );
-      await sql.query("DELETE FROM sessions WHERE user_id=$1 AND id<>$2", [
-        req.user.id,
-        req.session.id,
-      ]);
+      const replacement = await rotateSessions(sql, req.user.id);
       await audit(sql, req.user.id, "Пароль изменён", "user", req.user.id);
+      return replacement;
     });
+    applySession(reply, session);
     return { ok: true };
   });
   route(
@@ -310,9 +356,20 @@ export async function createApp(
   route("GET", "/team", () =>
     db.query("SELECT id,name,avatar_url FROM users WHERE active ORDER BY name"),
   );
+  route("PATCH", "/me/name", async (req) => {
+    const body = z.object({ name: text.transform((value) => value.replace(/\s+/g, " ")), version: z.number().int() }).parse(req.body);
+    return db.tx(async (sql) => {
+      const old = (await sql.query("SELECT * FROM users WHERE id=$1 FOR UPDATE", [req.user.id]))[0];
+      expectVersion(old, body.version);
+      const updated = (await sql.query("UPDATE users SET name=$1,version=version+1 WHERE id=$2 RETURNING *", [body.name, req.user.id]))[0];
+      await audit(sql, req.user.id, "Имя и фамилия изменены", "user", req.user.id, { name: old.name }, { name: updated.name });
+      return publicUser(updated);
+    });
+  });
   route("PUT", "/me/avatar", async (req) => {
     const { image } = z.object({ image: z.string().max(360000).nullable() }).parse(req.body);
-    const avatar = image === null ? null : await prepareAvatar(image);
+    await consumeBudget(db, budgetKey("avatar", req.user.id), 3, 5 * 60000);
+    const avatar = image === null ? null : await cpu.run(() => prepareAvatar(image));
     return db.tx(async (sql) => {
       const updated = (await sql.query("UPDATE users SET avatar_url=$1,version=version+1 WHERE id=$2 RETURNING *", [avatar, req.user.id]))[0];
       await audit(sql, req.user.id, avatar ? "Аватар обновлён" : "Аватар удалён", "user", req.user.id, null, { has_avatar: Boolean(avatar) });
@@ -333,14 +390,16 @@ export async function createApp(
     "/employees",
     async (req) => {
       const b = userSchema.parse(req.body),
-        id = uid(),
-        hashed = await hash(b.password);
+        id = uid();
+      await consumeBudget(db, budgetKey("employee-create", req.user.id), 10, 15 * 60000);
       const clean = {
         ...b,
         phone: phone(b.phone),
         rate: b.rate === null ? null : money(b.rate),
       };
       return db.tx(async (sql) => {
+        if (b.role === "admin") await reauthenticate(sql, req, b.current_password);
+        const hashed = await cpu.run(() => hash(b.password));
         const u = (
           await sql.query(
             "INSERT INTO users(id,name,phone,role,rate,pay_type,password_hash,must_change_password) VALUES($1,$2,$3,$4,$5,$6,$7,true) RETURNING *",
@@ -380,7 +439,7 @@ export async function createApp(
   route(
     "PATCH",
     "/employees/:id",
-    async (req) => {
+    async (req, reply) => {
       const id = paramsId(req),
         b = z
           .object({
@@ -392,10 +451,12 @@ export async function createApp(
             version: z.number().int(),
             reason: z.string().trim().min(3),
             password: z.string().min(10, "Пароль должен содержать минимум 10 символов").max(128).optional(),
+            current_password: z.string().max(128).optional(),
           })
           .parse(req.body);
-      const newPasswordHash = b.password ? await hash(b.password) : null;
-      return db.tx(async (sql) => {
+      if (b.password || b.current_password) await consumeBudget(db, budgetKey("credentials", req.user.id), 5, 15 * 60000);
+      let replacement: { token: string; csrf: string } | undefined;
+      const updated = await db.tx(async (sql) => {
         if (!b.active) {
           // Serialize administrator removals so two concurrent actions cannot remove all admins.
           await sql.query("SELECT id FROM users WHERE role='admin' AND active ORDER BY id FOR UPDATE");
@@ -405,11 +466,20 @@ export async function createApp(
         )[0];
         if (!old) fail("NOT_FOUND", "Сотрудник не найден", 404);
         expectVersion(old, b.version);
+        const sensitive = Boolean(b.password) || phone(b.phone) !== old.phone;
+        if (sensitive && old.role === "admin" && id !== req.user.id)
+          fail("ADMIN_CREDENTIALS_FORBIDDEN", "Администратор может менять данные для входа только своего аккаунта", 403);
+        if (sensitive) await reauthenticate(sql, req, b.current_password);
+        if (sensitive) {
+          if (!b.active) fail("INACTIVE_USER", "Для смены данных сначала восстановите сотрудника");
+          if (id === req.user.id) replacement = await rotateSessions(sql, id);
+          else await sql.query("DELETE FROM sessions WHERE user_id=$1", [id]);
+          await sql.query("DELETE FROM push_devices WHERE user_id=$1", [id]);
+        }
+        const newPasswordHash = b.password ? await cpu.run(() => hash(b.password!)) : null;
         if (newPasswordHash) {
           if (!b.active) fail("INACTIVE_USER", "Для смены пароля сначала восстановите сотрудника");
           await sql.query("UPDATE users SET password_hash=$1,must_change_password=$2 WHERE id=$3", [newPasswordHash, id !== req.user.id, id]);
-          await sql.query("DELETE FROM sessions WHERE user_id=$1 AND id<>$2", [id, req.session.id]);
-          await sql.query("DELETE FROM push_devices WHERE user_id=$1", [id]);
           await audit(sql, req.user.id, "Пароль сотрудника изменён", "user", id, null, { other_sessions_revoked: true }, b.reason);
         }
         if (!b.active) {
@@ -417,17 +487,23 @@ export async function createApp(
             fail("LAST_ADMIN", "Нельзя отключить последнего администратора");
           if (id === req.user.id)
             fail("SELF_DELETE", "Нельзя удалить свой аккаунт. Попросите другого администратора", 409);
+          const dismissedAt = await time(sql);
           const assigned = await sql.query(
-            "SELECT id,status FROM shifts WHERE user_id=$1 AND status NOT IN ('cancelled','worked','closed') AND end_at>$2 ORDER BY id FOR UPDATE",
-            [id, await time(sql)],
+            "SELECT id,status,start_at,end_at FROM shifts WHERE user_id=$1 AND status NOT IN ('cancelled','worked','closed') AND end_at>$2 ORDER BY id FOR UPDATE",
+            [id, dismissedAt],
           );
           for (const shift of assigned) {
-            await sql.query(
-              "UPDATE shifts SET status='cancelled',version=version+1,updated_at=clock_timestamp() WHERE id=$1",
-              [shift.id],
-            );
+            const future = new Date(shift.start_at) > dismissedAt;
+            if (future) await sql.query("UPDATE shifts SET status='cancelled',version=version+1,updated_at=clock_timestamp() WHERE id=$1", [shift.id]);
+            else {
+              const minute = Math.floor(dismissedAt.getTime() / 60000) * 60000;
+              const end = new Date(Math.min(new Date(shift.end_at).getTime(), Math.max(new Date(shift.start_at).getTime() + 60000, minute)));
+              await sql.query("UPDATE shifts SET end_at=$1,version=version+1,updated_at=clock_timestamp() WHERE id=$2", [end, shift.id]);
+              await audit(sql, req.user.id, "Смена завершена досрочно при удалении сотрудника", "shift", shift.id,
+                { end_at: shift.end_at }, { end_at: end.toISOString() }, b.reason);
+            }
             await closeListing(sql, shift.id);
-            await audit(sql, req.user.id, "Смена отменена при удалении сотрудника", "shift", shift.id,
+            if (future) await audit(sql, req.user.id, "Смена отменена при удалении сотрудника", "shift", shift.id,
               { status: shift.status, user_id: id }, { status: "cancelled", user_id: id }, b.reason);
           }
           await sql.query("UPDATE exchange_listings SET status='cancelled' WHERE listed_by=$1 AND status='open'", [id]);
@@ -467,6 +543,8 @@ export async function createApp(
         );
         return publicUser(u);
       });
+      if (replacement) applySession(reply, replacement);
+      return updated;
     },
     true,
   );
@@ -576,7 +654,7 @@ export async function createApp(
         b.start_time,
         b.end_time,
         b.pay_type,
-        money(b.rate),
+        b.pay_type === "hourly" ? "0.00" : money(b.rate ?? fail("FIXED_RATE_REQUIRED", "Укажите оплату за смену")),
         b.allow_exchange,
         b.active,
         id,
@@ -617,8 +695,8 @@ export async function createApp(
   route("GET", "/schedule", async (req) => {
     const [from, to] = range(req);
     return db.query(
-      `SELECT ${shiftProjection} ${req.user.role === "admin" ? financeProjection : ""} ${shiftJoins} ${req.user.role === "admin" ? adjustmentJoin : ""} WHERE s.date BETWEEN $1 AND $2 AND (s.user_id IS NULL OR u.active) ORDER BY s.start_at,u.name`,
-      [from, to],
+      `SELECT ${shiftProjection} ${req.user.role === "admin" ? financeProjection : ""} ${shiftJoins} ${req.user.role === "admin" ? adjustmentJoin : ""} WHERE s.date BETWEEN $1 AND $2 AND (s.user_id IS NULL OR u.active OR s.end_at<=$3) ORDER BY s.start_at,u.name`,
+      [from, to, await time(db)],
     );
   });
   route("GET", "/me/shifts", async (req) => {
@@ -741,14 +819,11 @@ export async function createApp(
       { date: b.date, user_id: b.user_id, status: b.status },
       b.reason,
     );
-    await notify(
-      sql,
-      [old?.user_id, b.user_id],
-      old ? "Ваша смена изменена" : "Новая смена",
-      `${b.date} · ${b.start_time}–${b.end_time}`,
-      "schedule",
-      `shift:${id}`,
-    );
+    if (old?.user_id && old.user_id !== b.user_id) await notify(sql, [old.user_id].filter((user) => user !== actor),
+      "Смена снята с вашего графика", `${old.date} · Вы больше не назначены на эту смену`, "schedule", "schedule");
+    await notify(sql, [b.user_id].filter((user) => user !== actor),
+      old?.user_id === b.user_id ? (b.status === "cancelled" ? "Смена отменена" : "Ваша смена изменена") : "Вам назначена смена",
+      `${b.date} · ${b.start_time}–${b.end_time}`, "schedule", `shift:${id}`);
     return { id };
   }
   route(
@@ -811,48 +886,11 @@ export async function createApp(
       }),
     true,
   );
-  route(
-    "POST",
-    "/schedule/repeat-week",
-    (req) =>
-      db.tx(async (sql) => {
-        const b = z
-          .object({ from: z.string(), to: z.string() })
-          .parse(req.body);
-        dateTime(b.from, "00:00");
-        dateTime(b.to, "00:00");
-        const delta = (Date.parse(b.to) - Date.parse(b.from)) / 86400000;
-        if (!Number.isInteger(delta) || delta === 0 || Math.abs(delta) > 366)
-          fail("INVALID_PERIOD", "Выберите другую неделю в пределах года");
-        const rows = await sql.query(
-          "SELECT *,date::text,to_char(start_at AT TIME ZONE 'Europe/Minsk','HH24:MI') AS start_time,to_char(end_at AT TIME ZONE 'Europe/Minsk','HH24:MI') AS end_time FROM shifts WHERE date >= $1::date AND date < $1::date+7 AND status<>'cancelled' ORDER BY start_at",
-          [b.from],
-        );
-        for (const s of rows) {
-          const date = new Date(Date.parse(s.date) + delta * 86400000)
-            .toISOString()
-            .slice(0, 10);
-          await writeShift(sql, req.user.id, {
-            date,
-            start_time: s.start_time,
-            end_time: s.end_time,
-            type_id: s.type_id,
-            user_id: s.user_id,
-            status: "planned",
-            comment: s.comment,
-            exchange_locked: s.exchange_locked,
-            rate_override: s.rate_override ? s.rate : null,
-          });
-        }
-        return { count: rows.length };
-      }),
-    true,
-  );
   route("GET", "/exchange", async (req) => {
     const q = req.query as any;
     const history = q.history === "true";
     return db.query(
-      `SELECT l.id,l.shift_id,l.status,l.taken_by,tu.name AS taken_name,l.closes_at,s.date::text,to_char(s.start_at AT TIME ZONE 'Europe/Minsk','HH24:MI') AS start_time,to_char(s.end_at AT TIME ZONE 'Europe/Minsk','HH24:MI') AS end_time,t.name AS type_name,l.listed_by AS user_id,u.name AS user_name,s.version FROM exchange_listings l JOIN shifts s ON s.id=l.shift_id JOIN users u ON u.id=l.listed_by JOIN shift_types t ON t.id=s.type_id LEFT JOIN users tu ON tu.id=l.taken_by WHERE ${history ? (req.user.role === "admin" ? "true" : "(l.listed_by=$1 OR l.taken_by=$1)") : "l.status='open' AND l.closes_at>clock_timestamp() AND s.status NOT IN ('cancelled','closed','worked') AND NOT s.exchange_locked AND t.allow_exchange AND t.active"} ORDER BY s.start_at DESC LIMIT 200`,
+      `SELECT l.id,l.shift_id,l.status,l.taken_by,tu.name AS taken_name,l.closes_at,s.date::text,to_char(s.start_at AT TIME ZONE 'Europe/Minsk','HH24:MI') AS start_time,to_char(s.end_at AT TIME ZONE 'Europe/Minsk','HH24:MI') AS end_time,t.name AS type_name,l.listed_by AS user_id,u.name AS user_name,s.version FROM exchange_listings l JOIN shifts s ON s.id=l.shift_id JOIN users u ON u.id=l.listed_by JOIN shift_types t ON t.id=s.type_id LEFT JOIN users tu ON tu.id=l.taken_by WHERE ${history ? (req.user.role === "admin" ? "true" : "(l.listed_by=$1 OR l.taken_by=$1)") : "l.status='open' AND l.closes_at>clock_timestamp() AND s.status NOT IN ('cancelled','closed','worked') AND NOT s.exchange_locked AND t.allow_exchange AND t.active AND NOT EXISTS (SELECT 1 FROM adjustments ax WHERE ax.shift_id=s.id)"} ORDER BY s.start_at DESC LIMIT 200`,
       history && req.user.role !== "admin" ? [req.user.id] : [],
     );
   });
@@ -863,6 +901,9 @@ export async function createApp(
         fail("FORBIDDEN", "Можно выставить только свою смену", 403);
       if (!s.user_id) fail("NO_OWNER", "Сначала назначьте сотрудника");
       await assertExchange(sql, s, await time(sql));
+      await consumeBudget(sql, budgetKey("exchange-publish", req.user.id), 5, 15 * 60000);
+      if ((await sql.query("SELECT id FROM exchange_listings WHERE shift_id=$1 AND created_at>clock_timestamp()-interval '1 minute' LIMIT 1", [s.id])).length)
+        fail("LISTING_COOLDOWN", "Повторная публикация доступна через минуту", 429);
       const id = uid();
       await sql.query(
         "INSERT INTO exchange_listings(id,shift_id,listed_by,closes_at) VALUES($1,$2,$3,LEAST($4::timestamptz,($5::date+time '19:00') AT TIME ZONE 'Europe/Minsk'))",
@@ -880,7 +921,7 @@ export async function createApp(
         null,
         { shift_id: s.id },
       );
-      const team = (await sql.query("SELECT id FROM users WHERE active")).map(
+      const team = (await sql.query("SELECT id FROM users WHERE active AND id<>$1 AND id<>$2", [s.user_id, req.user.id])).map(
         (x) => x.id,
       );
       await notify(
@@ -890,6 +931,7 @@ export async function createApp(
         `${s.date} · Посмотрите свободную смену`,
         "exchange",
         "exchange",
+        `exchange-published:${s.id}`,
       );
       return { id };
     }),
@@ -1069,6 +1111,7 @@ export async function createApp(
             "Назначение уже изменилось. Используйте редактор смены",
             409,
           );
+        await assertUnadjusted(sql, s.id);
         if ((await time(sql)) >= new Date(s.start_at))
           fail(
             "SHIFT_STARTED",
@@ -1132,8 +1175,8 @@ export async function createApp(
           );
         const old = (
           await sql.query(
-            "SELECT COALESCE(sum(minutes),0)::integer AS minutes,COALESCE(sum(amount),0)::text AS amount FROM adjustments WHERE shift_id=$1",
-            [s.id],
+            "SELECT COALESCE(sum(minutes),0)::integer AS minutes,COALESCE(sum(amount),0)::text AS amount FROM adjustments WHERE shift_id=$1 AND user_id=$2",
+            [s.id, s.user_id],
           )
         )[0];
         const minutes =
@@ -1147,17 +1190,18 @@ export async function createApp(
           fail("NEGATIVE_HOURS", "Итоговые часы не могут быть отрицательными");
         const check = (
           await sql.query(
-            "SELECT CASE WHEN $1='shift' THEN $2::numeric ELSE round($3::numeric*$2::numeric/60,2) END+$4::numeric+$5::numeric AS amount",
-            [s.pay_type, s.rate, minutes, old.amount, b.amount],
+            "SELECT CASE WHEN $1='shift' THEN $2::numeric ELSE round($3::numeric*$2::numeric/60,2) END+$4::numeric+$5::numeric AS amount,(CASE WHEN $1='shift' THEN $2::numeric ELSE round($3::numeric*$2::numeric/60,2) END+$5::numeric)-(CASE WHEN $1='shift' THEN $2::numeric ELSE round($6::numeric*$2::numeric/60,2) END) AS credit_amount",
+            [s.pay_type, s.rate, minutes, old.amount, b.amount, minutes - b.minutes],
           )
         )[0];
         if (Number(check.amount) < 0)
           fail("NEGATIVE_AMOUNT", "Итоговая сумма не может быть отрицательной");
         const id = uid();
         await sql.query(
-          "INSERT INTO adjustments(id,shift_id,user_id,minutes,amount,reason,created_by) VALUES($1,$2,$3,$4,$5,$6,$7)",
-          [id, s.id, s.user_id, b.minutes, b.amount, b.reason, req.user.id],
+          "INSERT INTO adjustments(id,shift_id,user_id,minutes,amount,reason,created_by,credit_amount) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+          [id, s.id, s.user_id, b.minutes, b.amount, b.reason, req.user.id, check.credit_amount],
         );
+        await closeListing(sql, s.id);
         await sql.query("UPDATE shifts SET version=version+1 WHERE id=$1", [
           s.id,
         ]);
@@ -1187,18 +1231,27 @@ export async function createApp(
     const q = req.query as any;
     const id = idSchema.parse(q.shift_id);
     return db.query(
-      `SELECT a.id,a.minutes,a.amount::text,a.reason,a.created_at,u.name AS author FROM adjustments a JOIN users u ON u.id=a.created_by WHERE a.shift_id=$1 ${req.user.role === "admin" ? "" : "AND a.user_id=$2"} ORDER BY a.created_at`,
+      `SELECT a.id,a.user_id,beneficiary.name AS user_name,a.credit_amount::text,a.minutes,a.amount::text,a.reason,a.created_at,u.name AS author FROM adjustments a JOIN users u ON u.id=a.created_by JOIN users beneficiary ON beneficiary.id=a.user_id WHERE a.shift_id=$1 ${req.user.role === "admin" ? "" : "AND a.user_id=$2"} ORDER BY a.created_at`,
       req.user.role === "admin" ? [id] : [id, req.user.id],
     );
   });
+  route("PATCH", "/adjustments/:id/credit", (req) => db.tx(async (sql) => {
+    const id = paramsId(req), body = reasonSchema.extend({ amount: z.string().regex(/^-?\d{1,8}(\.\d{1,2})?$/) }).parse(req.body);
+    const candidate = (await sql.query("SELECT shift_id FROM adjustments WHERE id=$1", [id]))[0];
+    if (!candidate) fail("NOT_FOUND", "Корректировка не найдена", 404);
+    const shift = await shiftForUpdate(sql, candidate.shift_id);
+    const row = (await sql.query("SELECT * FROM adjustments WHERE id=$1 FOR UPDATE", [id]))[0];
+    if (row.credit_amount !== null || row.user_id === shift.user_id) fail("ALREADY_RECONCILED", "Эта корректировка не требует уточнения", 409);
+    await sql.query("UPDATE adjustments SET credit_amount=$1 WHERE id=$2", [body.amount, id]);
+    await sql.query("UPDATE shifts SET version=version+1 WHERE id=$1", [shift.id]);
+    await audit(sql, req.user.id, "Сумма старой персональной корректировки уточнена", "adjustment", id, { credit_amount: null }, { credit_amount: body.amount }, body.reason);
+    return { ok: true };
+  }), true);
   async function payroll(req: FastifyRequest, own = false) {
     const [from, to] = range(req);
     const user = own ? req.user.id : (req.query as any).user_id;
     if (user) idSchema.parse(user);
-    return db.query(
-      `WITH totals AS (SELECT s.user_id,u.name,s.date,(EXTRACT(EPOCH FROM(s.end_at-s.start_at))/60+COALESCE(a.minutes,0))::integer AS minutes, CASE WHEN s.pay_type='shift' THEN s.rate ELSE round((EXTRACT(EPOCH FROM(s.end_at-s.start_at))/60+COALESCE(a.minutes,0))*s.rate/60,2) END+COALESCE(a.amount,0) AS amount,(s.end_at<=clock_timestamp() OR s.status IN ('worked','closed')) AS worked FROM shifts s JOIN users u ON u.id=s.user_id ${adjustmentJoin} WHERE s.date BETWEEN $1 AND $2 AND s.status<>'cancelled' ${user ? "AND s.user_id=$3" : ""}) SELECT user_id,name,date::text,COALESCE(sum(minutes) FILTER(WHERE worked),0)::integer AS minutes,COALESCE(sum(amount) FILTER(WHERE worked),0)::text AS amount,COALESCE(sum(minutes) FILTER(WHERE NOT worked),0)::integer AS planned_minutes,COALESCE(sum(amount) FILTER(WHERE NOT worked),0)::text AS planned_amount FROM totals GROUP BY user_id,name,date ORDER BY date DESC,name`,
-      user ? [from, to, user] : [from, to],
-    );
+    return payrollRows(db, from, to, user, await time(db));
   }
   route("GET", "/me/payroll", (req) => payroll(req, true));
   route("GET", "/payroll", (req) => payroll(req), true);
@@ -1303,10 +1356,15 @@ export async function createApp(
         platform: z.enum(["web", "android"]).default("web"),
       })
       .parse(req.body);
-    const [device] = await db.query(
-      "INSERT INTO push_devices(id,user_id,token,platform) VALUES($1,$2,$3,$4) ON CONFLICT(token) DO UPDATE SET user_id=$2,platform=$4 RETURNING id",
-      [uid(), req.user.id, b.token, b.platform],
-    );
+    const device = await db.tx(async (sql) => {
+      if (!(await sql.query("SELECT id FROM sessions WHERE id=$1 AND user_id=$2 AND expires_at>clock_timestamp() FOR SHARE", [req.session.id, req.user.id])).length)
+        fail("UNAUTHORIZED", "Сессия истекла. Войдите снова", 401);
+      await sql.query("DELETE FROM push_devices WHERE token=$1 AND (user_id<>$2 OR session_id<>$3)", [b.token, req.user.id, req.session.id]);
+      return (await sql.query(
+        "INSERT INTO push_devices(id,user_id,token,platform,session_id) VALUES($1,$2,$3,$4,$5) ON CONFLICT(token) DO UPDATE SET platform=$4 RETURNING id",
+        [uid(), req.user.id, b.token, b.platform, req.session.id],
+      ))[0];
+    });
     return { id: device.id };
   });
   route("GET", "/me/push-status", async (req) => {
@@ -1315,8 +1373,8 @@ export async function createApp(
     const device = id
       ? (
           await db.query(
-            "SELECT id FROM push_devices WHERE id=$1 AND user_id=$2",
-            [idSchema.parse(id), req.user.id],
+            "SELECT id FROM push_devices WHERE id=$1 AND user_id=$2 AND session_id=$3",
+            [idSchema.parse(id), req.user.id, req.session.id],
           )
         )[0]
       : null;
@@ -1348,11 +1406,12 @@ export async function createApp(
     true,
   );
   route("POST", "/me/push-test", async (req) => {
+    await consumeBudget(db, budgetKey("push-test", req.user.id), 3, 5 * 60000);
     const b = z.object({ device_id: idSchema }).parse(req.body);
     const device = (
       await db.query(
-        "SELECT id,token,platform FROM push_devices WHERE id=$1 AND user_id=$2",
-        [b.device_id, req.user.id],
+        "SELECT p.id,p.token,p.platform FROM push_devices p JOIN sessions s ON s.id=p.session_id AND s.user_id=p.user_id WHERE p.id=$1 AND p.user_id=$2 AND p.session_id=$3 AND s.expires_at>clock_timestamp()",
+        [b.device_id, req.user.id, req.session.id],
       )
     )[0];
     if (!device)
@@ -1429,8 +1488,10 @@ export async function createApp(
     },
     true,
   );
-  const streams = new Set<() => void>();
+  const streams = new StreamHub(db);
   route("GET", "/events", async (req, reply) => {
+    streams.assertCapacity(req.user.id);
+    req.releaseCapacity?.();
     reply.hijack();
     reply.raw.writeHead(200, {
       "Content-Type": "text/event-stream",
@@ -1439,49 +1500,10 @@ export async function createApp(
       "X-Accel-Buffering": "no",
     });
     reply.raw.write("retry: 3000\n\n");
-    let last = "";
-    let busy = false;
-    const timer = setInterval(async () => {
-      if (busy) return;
-      busy = true;
-      try {
-        const valid = await db.query(
-          "SELECT 1 FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.id=$1 AND s.expires_at>clock_timestamp() AND u.active",
-          [req.session.id],
-        );
-        if (!valid.length) {
-          reply.raw.write("event: revoked\ndata: {}\n\n");
-          stop();
-          return;
-        }
-        const current = (
-          await db.query("SELECT COALESCE(max(id),0)::text AS id FROM events")
-        )[0].id;
-        if (current !== last) {
-          last = current;
-          reply.raw.write(
-            `event: change\ndata: ${JSON.stringify({ revision: current })}\n\n`,
-          );
-        } else reply.raw.write(": heartbeat\n\n");
-      } catch {
-        stop();
-      } finally {
-        busy = false;
-      }
-    }, 1000);
-    function stop() {
-      clearInterval(timer);
-      streams.delete(stop);
-      reply.raw.end();
-    }
-    streams.add(stop);
-    reply.raw.on("close", () => {
-      clearInterval(timer);
-      streams.delete(stop);
-    });
+    streams.add(req.user.id, req.session.id, reply.raw);
   });
   app.addHook("preClose", async () => {
-    for (const stop of streams) stop();
+    streams.close();
   });
   return app;
 }

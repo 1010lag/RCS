@@ -56,6 +56,16 @@ test("desktop: dashboard, create shift, types, team, payroll, audit and profile"
     await expect(
       page.getByRole("heading", { name: title, exact: true }).first(),
     ).toBeVisible();
+    if (button === "Типы смен") {
+      const type = page.locator(".type-card").first();
+      await expect(type).not.toContainText("Br / час");
+      await type.getByRole("button", { name: "Настроить тип" }).click();
+      const editor = page.getByRole("dialog");
+      await expect(editor.locator('input[name="rate"]')).toHaveCount(0);
+      await editor.getByLabel("Модель оплаты", { exact: true }).selectOption("shift");
+      await expect(editor.getByLabel("Оплата за смену, Br", { exact: true })).toBeVisible();
+      await editor.getByRole("button", { name: "Отмена", exact: true }).click();
+    }
   }
   expect(errors).toEqual([]);
 });
@@ -483,6 +493,15 @@ test("barista uploads an avatar that persists and appears in day and month calen
     url: "http://127.0.0.1:3181", httpOnly: true, sameSite: "Strict",
   }]);
   await page.goto("/#profile");
+  await page.getByRole("button", { name: "Изменить имя и фамилию", exact: true }).click();
+  const nameDialog = page.getByRole("dialog");
+  await nameDialog.getByLabel("Имя и фамилия", { exact: true }).fill("Анна Новая");
+  await nameDialog.getByRole("button", { name: "Сохранить", exact: true }).click();
+  await expect(page.locator(".profile-card")).toContainText("Анна Новая");
+  await page.getByRole("button", { name: "Изменить имя и фамилию", exact: true }).click();
+  await nameDialog.getByLabel("Имя и фамилия", { exact: true }).fill("Анна Смирнова");
+  await nameDialog.getByRole("button", { name: "Сохранить", exact: true }).click();
+  await expect(page.locator(".profile-card")).toContainText("Анна Смирнова");
   const image = await sharp({ create: { width: 120, height: 80, channels: 3, background: "#da7759" } }).png().toBuffer();
   await page.getByLabel("Фотография профиля").setInputFiles({ name: "avatar.png", mimeType: "image/png", buffer: image });
   await expect(page.locator(".profile-card > .avatar img")).toHaveAttribute("src", /^data:image\/webp;base64,/);
@@ -496,6 +515,63 @@ test("barista uploads an avatar that persists and appears in day and month calen
   await page.locator(".bottom-nav").getByRole("button", { name: "Профиль", exact: true }).click();
   await page.getByRole("button", { name: "Удалить аватарку", exact: true }).click();
   await expect(page.locator(".profile-card > .avatar img")).toHaveCount(0);
+});
+
+test("month calendar contains only its dates and aligns weekdays for 28, 29, 30 and 31 day months", async ({ page }) => {
+  await page.context().addCookies([{
+    name: "rcs_session", value: "calendar-ui-test-session",
+    url: "http://127.0.0.1:3181", httpOnly: true, sameSite: "Strict",
+  }]);
+  await page.route("**/api/auth/me", async (route) => {
+    const response = await route.fetch();
+    await route.fulfill({ response, json: { ...await response.json(), server_now: "2026-11-01T12:00:00+03:00" } });
+  });
+  await page.goto("/#schedule");
+  await page.getByRole("button", { name: "Месяц", exact: true }).click();
+  async function checkMonth(month: string, days: number) {
+    const cells = page.locator(".month-cell");
+    await expect(cells).toHaveCount(days);
+    const expected = Array.from({ length: days }, (_, index) => `${month}-${String(index + 1).padStart(2, "0")}`);
+    expect(await cells.evaluateAll((items) => items.map((item) => item.getAttribute("data-date")))).toEqual(expected);
+    await expect(page.locator(".month-day")).toHaveText(Array.from({ length: days }, (_, index) => String(index + 1)));
+    await expect(page.locator(".month-add")).toHaveCount(days);
+    const column = (new Date(`${month}-01`).getUTCDay() + 6) % 7 + 1;
+    await expect(cells.first()).toHaveCSS("grid-column-start", String(column));
+    await expect(page.locator(".month-cell.outside")).toHaveCount(0);
+    const rows = Math.ceil((days + column - 1) / 7);
+    await expect(page.locator(".month-grid > div")).toHaveCount(rows * 7);
+    const placeholders = page.locator(".month-placeholder");
+    await expect(placeholders.locator("button")).toHaveCount(0);
+    await expect(placeholders).toHaveCount(rows * 7 - days);
+    const bounds = await page.locator(".month-grid > div").evaluateAll((items) => items.map((item) => {
+      const box = item.getBoundingClientRect();
+      return { x: box.x, y: box.y, width: box.width, height: box.height };
+    }));
+    for (let row = 0; row < rows; row++) {
+      for (let column = 0; column < 7; column++) {
+        const cell = bounds[row * 7 + column];
+        expect(Math.abs(cell.x - bounds[column].x)).toBeLessThan(1);
+        expect(Math.abs(cell.y - bounds[row * 7].y)).toBeLessThan(1);
+        expect(Math.abs(cell.width - bounds[0].width)).toBeLessThan(1);
+        expect(Math.abs(cell.height - bounds[row * 7].height)).toBeLessThan(1);
+      }
+    }
+    return rows;
+  }
+  expect(await checkMonth("2026-11", 30)).toBe(6);
+  await page.evaluate(() => { document.documentElement.dataset.theme = "dark"; });
+  await page.screenshot({ path: ".data/qa/calendar-november-dark.png", fullPage: true });
+  await page.getByRole("button", { name: "Предыдущий период", exact: true }).click();
+  expect(await checkMonth("2026-10", 31)).toBe(5);
+  for (let i = 0; i < 3; i++) await page.getByRole("button", { name: "Следующий период", exact: true }).click();
+  await checkMonth("2027-01", 31);
+  await page.getByRole("button", { name: "Следующий период", exact: true }).click();
+  expect(await checkMonth("2027-02", 28)).toBe(4);
+  for (let i = 0; i < 12; i++) await page.getByRole("button", { name: "Следующий период", exact: true }).click();
+  expect(await checkMonth("2028-02", 29)).toBe(5);
+  await page.screenshot({ path: ".data/qa/calendar-month-only.png", fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await checkMonth("2028-02", 29);
 });
 
 test("admin edits employee login data and their own phone and password", async ({ page }) => {
@@ -514,6 +590,7 @@ test("admin edits employee login data and their own phone and password", async (
   let dialog = page.getByRole("dialog");
   await dialog.getByLabel("Телефон", { exact: true }).fill("+375299999993");
   await dialog.getByLabel("Новый пароль", { exact: true }).fill("ResetBarista!2026");
+  await dialog.getByLabel("Текущий пароль администратора", { exact: true }).fill("BrowserTests!2026");
   await dialog.getByLabel("Причина изменения", { exact: true }).fill("Смена телефона и сброс пароля");
   await dialog.getByRole("button", { name: "Сохранить", exact: true }).click();
   await expect(card).toContainText("+375299999993");
@@ -523,6 +600,7 @@ test("admin edits employee login data and their own phone and password", async (
   dialog = page.getByRole("dialog");
   await dialog.getByLabel("Номер телефона", { exact: true }).fill("+375299999991");
   await dialog.getByLabel("Новый пароль", { exact: true }).fill("AdminMobile!2026");
+  await dialog.getByLabel("Текущий пароль", { exact: true }).fill("BrowserTests!2026");
   await dialog.getByRole("button", { name: "Сохранить", exact: true }).click();
   await expect(page.getByRole("status")).toContainText("Данные для входа обновлены");
   await expect(page.locator(".profile-card")).toContainText("+375299999991");

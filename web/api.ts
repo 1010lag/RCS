@@ -1,5 +1,12 @@
 import { nativeApp, nativeRequest } from "./runtime";
 let csrf = "";
+function rotatedSession(value?: string | null) {
+  if (!value) return;
+  csrf = value;
+  localStorage.removeItem("rcs-push-device");
+  localStorage.removeItem("rcs-push-user");
+  window.dispatchEvent(new Event("rcs-push-revoked"));
+}
 export function setCsrf(value: string) {
   csrf = value;
 }
@@ -31,6 +38,8 @@ export async function api<T = any>(
         response.data?.code ?? "REQUEST_ERROR",
         response.data?.message ?? "Не удалось выполнить запрос",
       );
+    const rotated = Object.entries(response.headers ?? {}).find(([key]) => key.toLowerCase() === "x-csrf-token")?.[1];
+    rotatedSession(typeof rotated === "string" ? rotated : null);
     return response.data as T;
   }
   const response = await fetch(`/api${path}`, {
@@ -50,6 +59,7 @@ export async function api<T = any>(
       result.code,
       result.message ?? "Не удалось выполнить запрос",
     );
+  rotatedSession(response.headers.get("X-CSRF-Token"));
   return result;
 }
 export async function cacheWrite(id: string, value: unknown) {

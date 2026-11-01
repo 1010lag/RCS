@@ -17,6 +17,7 @@ services:
     environment:
       DATABASE_URL: postgres://rcs:${POSTGRES_PASSWORD}@db:5432/rcs
       APP_ORIGIN: ${APP_ORIGIN:?Set HTTPS APP_ORIGIN}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
     ports:
       - 127.0.0.1:3001:3001
     depends_on:

@@ -39,8 +39,9 @@ async function call(
   body?: any,
   key?: string,
 ) {
-  return app.inject({
+  const response = await app.inject({
     method,
+    remoteAddress: `127.0.2.${Math.floor(loginAttempt / 4) % 250 + 1}`,
     url: "/api" + path,
     headers: {
       cookie: client.cookie,
@@ -49,6 +50,11 @@ async function call(
     },
     ...(body !== undefined ? { payload: body } : {}),
   });
+  if (response.headers["x-csrf-token"]) {
+    client.cookie = response.headers["set-cookie"]!.toString().split(";")[0];
+    client.csrf = String(response.headers["x-csrf-token"]);
+  }
+  return response;
 }
 async function shift(userId = ids[1], extra: any = {}) {
   const r = await call(admin, "POST", "/shifts", {
@@ -106,7 +112,7 @@ beforeEach(async () => {
   ids = [uid(), uid(), uid(), uid()];
   typeId = uid();
   await db.tx(async (sql) => {
-    await sql.query("TRUNCATE users,shift_types CASCADE");
+    await sql.query("TRUNCATE users,shift_types,request_limits CASCADE");
     for (let i = 0; i < 4; i++)
       await sql.query(
         "INSERT INTO users(id,name,phone,role,password_hash,rate) VALUES($1,$2,$3,$4,$5,$6)",
@@ -224,7 +230,7 @@ describe("Archiving employees and shift types", () => {
     expect(result.json().active).toBe(false);
     expect((await call(a, "GET", "/auth/me")).statusCode).toBe(401);
     expect((await call(admin, "GET", "/team")).json().some((u: any) => u.id === ids[1])).toBe(false);
-    expect((await call(admin, "GET", `/schedule?from=${yesterday}&to=${yesterday}`)).json().some((s: any) => s.id === id)).toBe(false);
+    expect((await call(admin, "GET", `/schedule?from=${yesterday}&to=${yesterday}`)).json().some((s: any) => s.id === id)).toBe(true);
     expect((await db.query("SELECT * FROM users WHERE id=$1", [ids[1]]))).toHaveLength(1);
     expect((await db.query("SELECT * FROM adjustments WHERE shift_id=$1", [id]))).toHaveLength(1);
     expect((await db.query("SELECT * FROM sessions WHERE user_id=$1", [ids[1]]))).toHaveLength(0);
@@ -242,22 +248,29 @@ describe("Archiving employees and shift types", () => {
     await db.query("UPDATE users SET role='admin' WHERE id=$1", [ids[2]]);
     expect((await archiveEmployee(0)).json().code).toBe("SELF_DELETE");
   });
-  it("immediately cancels current and future shifts, removes the employee from all calendars and closes exchange listings", async () => {
+  it("finishes the current shift at dismissal, cancels only future shifts and keeps worked history visible", async () => {
     const current = await shift(ids[1], { start_time: "08:00", end_time: "12:00" });
     const future = await shift(), listing = await list(future);
     const unaffected = await shift(ids[2]);
+    clock = new Date(`${day}T10:37:45+03:00`);
     const result = await archiveEmployee(1);
     expect(result.statusCode, result.body).toBe(200);
-    for (const id of [current, future]) {
+    for (const id of [future]) {
       const saved = (await db.query("SELECT status,version FROM shifts WHERE id=$1", [id]))[0];
       expect(saved.status).toBe("cancelled");
       expect(saved.version).toBeGreaterThan(1);
       expect((await db.query("SELECT * FROM audit_logs WHERE entity_id=$1 AND action='Смена отменена при удалении сотрудника'", [id]))).toHaveLength(1);
     }
+    const shortened = (await db.query("SELECT status,end_at FROM shifts WHERE id=$1", [current]))[0];
+    expect(shortened.status).toBe("confirmed");
+    expect(new Date(shortened.end_at).toISOString()).toBe(new Date(`${day}T10:37:00+03:00`).toISOString());
+    expect((await db.query("SELECT id FROM audit_logs WHERE entity_id=$1 AND action='Смена завершена досрочно при удалении сотрудника'", [current]))).toHaveLength(1);
+    const pay = (await call(admin, "GET", `/payroll?from=${day}&to=${day}&user_id=${ids[1]}`)).json()[0];
+    expect(pay).toMatchObject({ minutes: 157, amount: "36.63", planned_minutes: 0 });
     expect((await db.query("SELECT status FROM exchange_listings WHERE id=$1", [listing]))[0].status).toBe("cancelled");
     for (const client of [admin, b]) {
       const schedule = (await call(client, "GET", `/schedule?from=${day}&to=${day}`)).json();
-      expect(schedule.map((shift: any) => shift.id)).toEqual([unaffected]);
+      expect(schedule.map((shift: any) => shift.id)).toEqual([current, unaffected]);
       expect((await call(client, "GET", "/exchange")).json().some((entry: any) => entry.id === listing)).toBe(false);
     }
   });
@@ -279,6 +292,19 @@ describe("Archiving employees and shift types", () => {
 });
 
 describe("Account credentials and shared avatars", () => {
+  it("lets a barista change only their own full name and updates the calendar without changing pay", async () => {
+    const id = await shift();
+    const before = (await call(a, "GET", `/shifts/${id}`)).json();
+    const result = await call(a, "PATCH", "/me/name", { name: "  Анна   Новая  ", version: 1, user_id: ids[2], role: "admin", rate: "999.00" });
+    expect(result.statusCode, result.body).toBe(200);
+    expect(result.json()).toMatchObject({ name: "Анна Новая", role: "barista", rate: "14.00" });
+    expect((await db.query("SELECT name FROM users WHERE id=$1", [ids[2]]))[0].name).toBe("Максим");
+    expect((await call(b, "GET", "/team")).json().find((u: any) => u.id === ids[1]).name).toBe("Анна Новая");
+    expect((await call(b, "GET", `/schedule?from=${day}&to=${day}`)).json()[0].user_name).toBe("Анна Новая");
+    expect((await call(a, "GET", `/shifts/${id}`)).json()).toMatchObject({ rate: before.rate, amount: before.amount });
+    expect((await call(a, "PATCH", "/me/name", { name: "Другой", version: 1 })).statusCode).toBe(409);
+    expect((await call(a, "PATCH", "/me/name", { name: "   ", version: 2 })).statusCode).toBe(422);
+  });
   async function edit(index: number, client: Client, extra: Record<string, unknown> = {}) {
     const record = (await db.query("SELECT name,phone,rate::text,pay_type,active,version FROM users WHERE id=$1", [ids[index]]))[0];
     return call(client, "PATCH", `/employees/${ids[index]}`, { ...record, reason: "Обновление данных для входа", ...extra });
@@ -286,12 +312,15 @@ describe("Account credentials and shared avatars", () => {
   async function signIn(phone: string, password: string) {
     return app.inject({ method: "POST", url: "/api/auth/login", payload: { phone, password } });
   }
-  it("lets an admin change their own phone and password atomically, keeping only the current session", async () => {
+  it("rotates admin credentials and revokes every copied old session", async () => {
     const otherSession = await login(0);
-    const result = await edit(0, admin, { phone: "+375299999901", password: "OwnNewPassword!2026" });
+    const stolen = { ...admin };
+    const result = await edit(0, admin, { phone: "+375299999901", password: "OwnNewPassword!2026", current_password: "TestPassword!2026" });
     expect(result.statusCode, result.body).toBe(200);
     expect(result.json()).toMatchObject({ phone: "+375299999901", must_change_password: false });
     expect((await call(admin, "GET", "/auth/me")).statusCode).toBe(200);
+    expect(admin.cookie).not.toBe(stolen.cookie);
+    expect((await call(stolen, "GET", "/auth/me")).statusCode).toBe(401);
     expect((await call(otherSession, "GET", "/auth/me")).statusCode).toBe(401);
     expect((await signIn("+375290000000", "TestPassword!2026")).statusCode).toBe(401);
     expect((await signIn("+375299999901", "TestPassword!2026")).statusCode).toBe(401);
@@ -299,7 +328,7 @@ describe("Account credentials and shared avatars", () => {
   });
   it("lets an admin reset employee credentials and rejects a barista reset", async () => {
     expect((await edit(1, a, { password: "SpoofedPassword!2026" })).statusCode).toBe(403);
-    const result = await edit(1, admin, { phone: "+375299999902", password: "ResetEmployee!2026" });
+    const result = await edit(1, admin, { phone: "+375299999902", password: "ResetEmployee!2026", current_password: "TestPassword!2026" });
     expect(result.statusCode, result.body).toBe(200);
     expect((await call(a, "GET", "/auth/me")).statusCode).toBe(401);
     const session = await signIn("+375299999902", "ResetEmployee!2026");
@@ -334,6 +363,143 @@ describe("Account credentials and shared avatars", () => {
     }
     expect((await call(a, "PUT", "/me/avatar", { image: "A".repeat(410000) })).statusCode).toBe(413);
     expect((await db.query("SELECT avatar_url FROM users WHERE id=$1", [ids[1]]))[0].avatar_url).toBeNull();
+  });
+});
+
+describe("Security regressions", () => {
+  async function edit(index: number, extra: Record<string, unknown> = {}) {
+    const record = (await db.query("SELECT name,phone,rate::text,pay_type,active,version FROM users WHERE id=$1", [ids[index]]))[0];
+    return call(admin, "PATCH", `/employees/${ids[index]}`, { ...record, reason: "Проверка защиты доступа", ...extra });
+  }
+  it("requires the current password for credential changes and cannot reset another administrator", async () => {
+    expect((await edit(0, { password: "DifferentPassword!2026" })).json().code).toBe("REAUTH_REQUIRED");
+    expect((await edit(0, { password: "DifferentPassword!2026", current_password: "wrong" })).json().code).toBe("REAUTH_FAILED");
+    await db.query("UPDATE users SET role='admin' WHERE id=$1", [ids[2]]);
+    expect((await edit(2, { password: "DifferentPassword!2026", current_password: "TestPassword!2026" })).json().code).toBe("ADMIN_CREDENTIALS_FORBIDDEN");
+    expect((await edit(2, { phone: "+375299999777", current_password: "TestPassword!2026" })).statusCode).toBe(403);
+    expect((await call(admin, "POST", "/employees", { name: "Второй админ", phone: "+375299999778", role: "admin", password: "DifferentPassword!2026" })).json().code).toBe("REAUTH_REQUIRED");
+  });
+  it("limits an account across changing client IPs and retains the block after an API restart", async () => {
+    for (let i = 0; i < 8; i++) {
+      const response = await app.inject({ method: "POST", url: "/api/auth/login", remoteAddress: `192.0.2.${i + 1}`, headers: { "x-forwarded-for": `203.0.113.${i + 1}` }, payload: { phone: "+375290000001", password: "wrong" } });
+      expect(response.statusCode).toBe(401);
+    }
+    const restarted = await createApp(db);
+    try {
+      const response = await restarted.inject({ method: "POST", url: "/api/auth/login", remoteAddress: "192.0.2.99", payload: { phone: "+375290000001", password: "TestPassword!2026" } });
+      expect(response.statusCode).toBe(429);
+      expect(Number(response.headers["retry-after"])).toBeGreaterThan(0);
+    } finally { await restarted.close(); }
+  });
+  it("ignores spoofed forwarded IPs by default", async () => {
+    for (let i = 0; i < 21; i++) {
+      const response = await app.inject({ method: "POST", url: "/api/auth/login", remoteAddress: "192.0.2.200", headers: { "x-forwarded-for": `203.0.113.${i + 1}` }, payload: { phone: `+37529999${String(i).padStart(4, "0")}`, password: "wrong" } });
+      expect(response.statusCode).toBe(i < 20 ? 401 : 429);
+    }
+  });
+  it("bounds expensive avatar and password work per account", async () => {
+    for (let i = 0; i < 4; i++) expect((await call(a, "PUT", "/me/avatar", { image: "data:image/png;base64,bm90YW5pbWFnZQ==" })).statusCode).toBe(i < 3 ? 422 : 429);
+    for (let i = 0; i < 6; i++) expect((await call(b, "POST", "/auth/password", { current: "wrong", password: "NewPassword!2026" })).statusCode).toBe(i < 5 ? 403 : 429);
+  });
+  it("finishes concurrent account creation and login without holding CPU slots while waiting for the database", async () => {
+    const create = call(admin, "POST", "/employees", { name: "Параллельный вход", phone: "+375299999770", password: "ConcurrentPassword!2026" });
+    const logins = [1, 2, 3].map((index) => login(index));
+    expect((await create).statusCode).toBe(200);
+    await Promise.all(logins);
+    expect((await app.inject("/api/health")).statusCode).toBe(200);
+  });
+  it("revokes all push devices and stolen cookies on a password change", async () => {
+    const other = await login(1), stolen = { ...a };
+    for (const [client, token] of [[a, "x".repeat(40)], [other, "y".repeat(40)]] as const) {
+      expect((await call(client, "POST", "/me/push-devices", { token })).statusCode).toBe(200);
+    }
+    expect((await call(a, "POST", "/auth/password", { current: "TestPassword!2026", password: "ChangedPassword!2026" })).statusCode).toBe(200);
+    expect((await call(a, "GET", "/auth/me")).statusCode).toBe(200);
+    expect((await call(stolen, "GET", "/auth/me")).statusCode).toBe(401);
+    expect((await call(other, "GET", "/auth/me")).statusCode).toBe(401);
+    expect(await db.query("SELECT * FROM push_devices WHERE user_id=$1", [ids[1]])).toHaveLength(0);
+  });
+  it("does not deliver queued push to an expired session", async () => {
+    await call(a, "POST", "/me/push-devices", { token: "expired-device-token".repeat(2) });
+    await call(admin, "POST", "/admin/notifications", { title: "Конфиденциально", body: "Текст только для действующей сессии", user_id: ids[1] });
+    expect(await db.query("SELECT * FROM deliveries")).toHaveLength(1);
+    await db.query("UPDATE sessions SET expires_at=clock_timestamp()-interval '1 second' WHERE user_id=$1", [ids[1]]);
+    const sent: unknown[] = [];
+    await tick(db, { settings: async () => ({ ready: true }) as PushSettings, send: async (message) => { sent.push(message); return "fake"; } });
+    expect(sent).toEqual([]);
+    expect(await db.query("SELECT * FROM push_devices")).toHaveLength(0);
+    expect(await db.query("SELECT * FROM deliveries")).toHaveLength(0);
+  });
+});
+
+describe("Personal adjustments and exchange notifications", () => {
+  it("keeps a future personal bonus with its beneficiary and blocks every owner-transfer path", async () => {
+    const id = await shift(), listing = await list(id), before = await quote(listing);
+    expect((await call(admin, "POST", `/shifts/${id}/adjustments`, { minutes: 0, amount: "50.00", reason: "Премия Анне" })).statusCode).toBe(200);
+    expect((await db.query("SELECT status FROM exchange_listings WHERE id=$1", [listing]))[0].status).toBe("cancelled");
+    expect((await call(a, "POST", `/shifts/${id}/exchange`)).json().code).toBe("ADJUSTED_OWNER");
+    expect((await call(b, "POST", `/exchange/${listing}/take`, { version: before.version }, uid())).statusCode).toBe(409);
+    const saved = (await call(admin, "GET", `/shifts/${id}`)).json();
+    expect((await call(admin, "PATCH", `/shifts/${id}`, { date: day, start_time: saved.start_time, end_time: saved.end_time, type_id: typeId, user_id: ids[2], version: saved.version, reason: "Переназначить смену" })).json().code).toBe("ADJUSTED_OWNER");
+    expect((await call(a, "GET", `/me/payroll?from=${day}&to=${day}`)).json()[0].planned_amount).toBe("78.00");
+    expect((await call(b, "GET", `/me/payroll?from=${day}&to=${day}`)).json()).toEqual([]);
+  });
+  it("blocks rollback after the recipient receives a correction", async () => {
+    const id = await shift(), listing = await list(id), q = await quote(listing);
+    await call(b, "POST", `/exchange/${listing}/take`, { version: q.version }, uid());
+    await call(admin, "POST", `/shifts/${id}/adjustments`, { minutes: 30, amount: "5.00", reason: "Доплата Максиму" });
+    const response = await call(admin, "POST", `/exchange/${listing}/rollback`, { reason: "Откат назначения" });
+    expect(response.json().code).toBe("ADJUSTED_OWNER");
+    expect((await call(b, "GET", `/me/payroll?from=${day}&to=${day}`)).json()[0].planned_amount).toBe("45.00");
+  });
+  it("credits already-transferred legacy money to the original employee, never to the current owner", async () => {
+    const id = await shift();
+    await db.query("INSERT INTO adjustments(id,shift_id,user_id,amount,reason,created_by) VALUES($1,$2,$3,50,'Старая премия',$4)", [uid(), id, ids[1], ids[0]]);
+    await db.query("UPDATE shifts SET user_id=$1,rate=16 WHERE id=$2", [ids[2], id]);
+    expect((await call(a, "GET", `/me/payroll?from=${day}&to=${day}`)).json()[0].planned_amount).toBe("50.00");
+    expect((await call(b, "GET", `/me/payroll?from=${day}&to=${day}`)).json()[0].planned_amount).toBe("32.00");
+    expect((await call(a, "GET", `/adjustments?shift_id=${id}`)).json()).toHaveLength(1);
+    expect((await call(b, "GET", `/adjustments?shift_id=${id}`)).json()).toHaveLength(0);
+    expect((await call(b, "GET", `/shifts/${id}`)).json().amount).toBe("32.00");
+  });
+  it("requires explicit reconciliation when the old hourly rate is unknown", async () => {
+    const id = await shift(ids[2]), correction = uid();
+    await db.query("INSERT INTO adjustments(id,shift_id,user_id,minutes,reason,created_by) VALUES($1,$2,$3,30,'Старые часы',$4)", [correction, id, ids[1], ids[0]]);
+    expect((await call(a, "GET", `/me/payroll?from=${day}&to=${day}`)).json().code).toBe("ADJUSTMENT_REVIEW_REQUIRED");
+    expect((await call(a, "PATCH", `/adjustments/${correction}/credit`, { amount: "7.00", reason: "Проверенная ставка 14 Br" })).statusCode).toBe(403);
+    expect((await call(admin, "PATCH", `/adjustments/${correction}/credit`, { amount: "7.00", reason: "Проверенная ставка 14 Br" })).statusCode).toBe(200);
+    expect((await call(a, "GET", `/me/payroll?from=${day}&to=${day}`)).json()[0].planned_amount).toBe("7.00");
+    expect((await call(b, "GET", `/me/payroll?from=${day}&to=${day}`)).json()[0].planned_amount).toBe("32.00");
+  });
+  it("suppresses self notices, deduplicates republishing, and limits publication bursts", async () => {
+    const id = await shift(), listing = await list(id);
+    expect((await db.query("SELECT * FROM notifications WHERE user_id=$1 AND title='Новая смена на бирже'", [ids[1]]))).toHaveLength(0);
+    await call(a, "POST", `/exchange/${listing}/withdraw`);
+    expect((await call(a, "POST", `/shifts/${id}/exchange`)).statusCode).toBe(429);
+    await db.query("UPDATE exchange_listings SET created_at=clock_timestamp()-interval '2 minutes' WHERE id=$1", [listing]);
+    const again = await list(id);
+    expect((await db.query("SELECT * FROM notifications WHERE user_id=$1 AND title='Новая смена на бирже'", [ids[2]]))).toHaveLength(1);
+    await call(a, "POST", `/exchange/${again}/withdraw`);
+    for (let i = 1; i <= 4; i++) {
+      const nextDay = new Date(Date.parse(day) + i * 86400000).toISOString().slice(0, 10), next = await shift(ids[1], { date: nextDay });
+      expect((await call(a, "POST", `/shifts/${next}/exchange`)).statusCode).toBe(i < 4 ? 200 : 429);
+    }
+  });
+  it("sends a removal message to the old owner when an admin reassigns a shift", async () => {
+    const id = await shift(), saved = (await call(admin, "GET", `/shifts/${id}`)).json();
+    await db.query("DELETE FROM deliveries");
+    await db.query("DELETE FROM notifications");
+    expect((await call(admin, "PATCH", `/shifts/${id}`, { date: day, start_time: saved.start_time, end_time: saved.end_time, type_id: typeId, user_id: ids[2], version: saved.version, reason: "Переназначение" })).statusCode).toBe(200);
+    const notices = await db.query("SELECT user_id,title FROM notifications ORDER BY user_id");
+    expect(notices).toContainEqual({ user_id: ids[1], title: "Смена снята с вашего графика" });
+    expect(notices).toContainEqual({ user_id: ids[2], title: "Вам назначена смена" });
+    expect(notices.some((row) => row.title === "Ваша смена изменена")).toBe(false);
+  });
+  it("uses the Minsk day for requests without an explicit period after midnight", async () => {
+    const id = await shift();
+    clock = new Date(`${day}T00:30:00+03:00`);
+    expect((await call(admin, "GET", "/schedule")).json().map((row: any) => row.id)).toContain(id);
+    expect((await call(a, "GET", "/me/payroll")).json()[0].date).toBe(day);
   });
 });
 
@@ -642,6 +808,21 @@ describe("Atomic exchange", () => {
   });
 });
 describe("Individual hourly rates", () => {
+  it("creates hourly types without a type rate and calculates pay only from the employee rate", async () => {
+    const result = await call(admin, "POST", "/shift-types", { name: "Без ставки типа", start_time: "20:00", end_time: "22:00" });
+    expect(result.statusCode, result.body).toBe(200);
+    const newType = result.json().id;
+    expect((await db.query("SELECT pay_type,rate::text FROM shift_types WHERE id=$1", [newType]))[0]).toMatchObject({ pay_type: "hourly", rate: "0.00" });
+    await db.query("UPDATE shift_types SET rate=999 WHERE id=$1", [newType]);
+    const id = await shift(ids[1], { type_id: newType });
+    expect((await call(a, "GET", `/shifts/${id}`)).json()).toMatchObject({ rate: "14.00", amount: "28.00" });
+    await db.query("UPDATE users SET rate=NULL WHERE id=$1", [ids[2]]);
+    const failed = await call(admin, "POST", "/shifts", { date: day, start_time: "20:00", end_time: "22:00", type_id: newType, user_id: ids[2] });
+    expect(failed.statusCode).toBe(422);
+    expect(failed.json().code).toBe("EMPLOYEE_RATE_REQUIRED");
+    expect((await call(a, "GET", `/shifts/${id}`)).json().amount).toBe("28.00");
+    expect((await call(admin, "POST", "/shift-types", { name: "Фиксированная", start_time: "08:00", end_time: "10:00", pay_type: "shift" })).json().code).toBe("FIXED_RATE_REQUIRED");
+  });
   it("updates future hourly shifts but preserves past, fixed and manually overridden rates", async () => {
     const offset = (n: number) =>
       new Date(Date.parse(day) + n * 86400000).toISOString().slice(0, 10);
@@ -751,24 +932,6 @@ describe("Worker", () => {
         .map((x) => x.id)
         .sort(),
     ).toEqual([second, foreign].sort());
-  });
-  it("rolls back an entire copied week when any destination shift conflicts", async () => {
-    const next = (offset: number) =>
-      new Date(Date.parse(day) + offset * 86400000).toISOString().slice(0, 10);
-    await shift(ids[1]);
-    await shift(ids[1], { date: next(1) });
-    await shift(ids[1], { date: next(8) });
-    const result = await call(admin, "POST", "/schedule/repeat-week", {
-      from: day,
-      to: next(7),
-    });
-    expect(result.statusCode).toBe(409);
-    expect(
-      (await db.query("SELECT count(*)::integer AS n FROM shifts"))[0].n,
-    ).toBe(3);
-    expect(
-      await db.query("SELECT id FROM shifts WHERE date=$1", [next(7)]),
-    ).toEqual([]);
   });
   it("expires listings while keeping owner and is safe to retry", async () => {
     const yesterday = new Date(Date.parse(localDate()) - 86400000)

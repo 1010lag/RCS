@@ -14,7 +14,7 @@ export interface Database extends Sql {
 export async function openDatabase(path?: string): Promise<Database> {
   let db: Database;
   if (process.env.DATABASE_URL && path === undefined) {
-    const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+    const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 10, connectionTimeoutMillis: 3000 });
     db = {
       query: async (s, p) => (await pool.query(s, p)).rows,
       async tx(fn) {
@@ -45,11 +45,15 @@ export async function openDatabase(path?: string): Promise<Database> {
     const pg = new PGlite({ dataDir, extensions: { btree_gist } });
     await pg.waitReady;
     let tail: Promise<any> = Promise.resolve();
+    let pending = 0;
     // Every operation joins one queue: reads must not run inside another request's transaction.
     const queued = <T>(fn: () => Promise<T>): Promise<T> => {
+      if (pending >= 64) return Promise.reject(Object.assign(new Error("Database queue is full"), { code: "DB_BUSY" }));
+      pending++;
       const result = tail.then(fn);
-      tail = result.catch(() => {});
-      return result;
+      const settled = result.finally(() => { pending--; });
+      tail = settled.catch(() => {});
+      return settled;
     };
     db = {
       query: (s, p) => queued(async () => (await pg.query(s, p)).rows as any),

@@ -183,6 +183,7 @@ export async function assertExchange(sql: Sql, shift: any, time?: Date) {
       shift.type_id,
     ])
   )[0];
+  await assertUnadjusted(sql, shift.id);
   if (
     shift.exchanged ||
     shift.exchange_locked ||
@@ -193,6 +194,10 @@ export async function assertExchange(sql: Sql, shift: any, time?: Date) {
     fail("EXCHANGE_FORBIDDEN", "Эту смену нельзя передать через биржу", 409);
   return type;
 }
+export async function assertUnadjusted(sql: Sql, shiftId: string) {
+  if ((await sql.query("SELECT id FROM adjustments WHERE shift_id=$1 LIMIT 1", [shiftId])).length)
+    fail("ADJUSTED_OWNER", "У смены есть персональные корректировки. Передача и откат владельца запрещены", 409);
+}
 export async function closeListing(sql: Sql, shiftId: string) {
   await sql.query(
     "UPDATE exchange_listings SET status='cancelled' WHERE shift_id=$1 AND status='open'",
@@ -200,13 +205,16 @@ export async function closeListing(sql: Sql, shiftId: string) {
   );
 }
 export function rateFor(type: any, user: any, override?: string | null) {
-  return override != null
-    ? money(override)
-    : user?.rate != null && user.pay_type === type.pay_type
-      ? user.rate
-      : type.rate;
+  if (override != null) return money(override);
+  if (type.pay_type === "hourly") {
+    if (!user) return "0.00";
+    if (user.rate == null || user.pay_type !== "hourly")
+      return fail("EMPLOYEE_RATE_REQUIRED", "Сначала укажите почасовую ставку сотрудника в разделе «Команда»");
+    return money(user.rate);
+  }
+  return user?.rate != null && user.pay_type === "shift" ? user.rate : type.rate;
 }
-export const shiftProjection = `s.id, s.date::text, to_char(s.start_at AT TIME ZONE 'Europe/Minsk','HH24:MI') AS start_time, to_char(s.end_at AT TIME ZONE 'Europe/Minsk','HH24:MI') AS end_time, s.start_at, s.end_at, s.type_id, t.name AS type_name, s.user_id, u.name AS user_name, u.avatar_url AS user_avatar_url, s.status, s.version, s.exchanged, s.exchange_locked, (t.allow_exchange AND t.active) AS exchange_allowed, l.id AS exchange_id, LEAST(s.start_at, (s.date + time '19:00') AT TIME ZONE 'Europe/Minsk') AS closes_at`;
+export const shiftProjection = `s.id, s.date::text, to_char(s.start_at AT TIME ZONE 'Europe/Minsk','HH24:MI') AS start_time, to_char(s.end_at AT TIME ZONE 'Europe/Minsk','HH24:MI') AS end_time, s.start_at, s.end_at, s.type_id, t.name AS type_name, s.user_id, u.name AS user_name, u.avatar_url AS user_avatar_url, s.status, s.version, s.exchanged, s.exchange_locked, (t.allow_exchange AND t.active AND NOT EXISTS (SELECT 1 FROM adjustments ax WHERE ax.shift_id=s.id)) AS exchange_allowed, l.id AS exchange_id, LEAST(s.start_at, (s.date + time '19:00') AT TIME ZONE 'Europe/Minsk') AS closes_at`;
 export const shiftJoins = `FROM shifts s JOIN shift_types t ON t.id=s.type_id LEFT JOIN users u ON u.id=s.user_id LEFT JOIN exchange_listings l ON l.shift_id=s.id AND l.status='open' AND l.closes_at>clock_timestamp()`;
 export const financeProjection = `, (EXTRACT(EPOCH FROM (s.end_at-s.start_at))/60)::integer AS minutes, s.rate::text, s.pay_type, s.comment, COALESCE(a.minutes,0)::integer AS adjustment_minutes, COALESCE(a.amount,0)::text AS adjustment_amount, (CASE WHEN s.pay_type='shift' THEN s.rate ELSE round(((EXTRACT(EPOCH FROM(s.end_at-s.start_at))/60)+COALESCE(a.minutes,0))*s.rate/60,2) END + COALESCE(a.amount,0))::text AS amount`;
-export const adjustmentJoin = `LEFT JOIN (SELECT shift_id,sum(minutes) AS minutes,sum(amount) AS amount FROM adjustments GROUP BY shift_id) a ON a.shift_id=s.id`;
+export const adjustmentJoin = `LEFT JOIN (SELECT shift_id,user_id,sum(minutes) AS minutes,sum(amount) AS amount FROM adjustments GROUP BY shift_id,user_id) a ON a.shift_id=s.id AND a.user_id=s.user_id`;

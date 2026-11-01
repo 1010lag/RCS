@@ -56,6 +56,10 @@ await db.tx(async (sql) => {
     "INSERT INTO sessions(id,user_id,csrf,expires_at) VALUES($1,$2,$3,clock_timestamp()+interval '1 hour')",
     [createHash("sha256").update("admin-ui-test-session").digest("hex"), ids[0], "admin-ui-test-csrf"],
   );
+  // Long calendar navigation gets its own account, independently of mutation tests.
+  const calendarAdmin = uid();
+  await sql.query("INSERT INTO users(id,name,phone,role,password_hash) VALUES($1,'Календарь тест','+375299999980','admin',$2)", [calendarAdmin, password]);
+  await sql.query("INSERT INTO sessions(id,user_id,csrf,expires_at) VALUES($1,$2,'calendar-csrf',clock_timestamp()+interval '1 hour')", [createHash("sha256").update("calendar-ui-test-session").digest("hex"), calendarAdmin]);
   await sql.query(
     "INSERT INTO shifts(id,date,start_at,end_at,type_id,user_id,status,pay_type,rate,comment) VALUES($1,$2,$3,$4,$5,$6,'confirmed','hourly',13,'Android exchange regression')",
     [uid(), nativeDay, dateTime(nativeDay, "08:00"), dateTime(nativeDay, "15:00"), type, ids[1]],

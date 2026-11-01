@@ -3,7 +3,6 @@ import {
   ChevronLeft,
   ChevronRight,
   Plus,
-  Copy,
   CalendarDays,
   Search,
 } from "lucide-react";
@@ -28,7 +27,6 @@ type Props = {
   admin: boolean;
   open: (s: Shift) => void;
   create: (date: string, userId?: string) => void;
-  repeat?: (from: string) => void;
   compact?: boolean;
 };
 export function Schedule({
@@ -41,7 +39,6 @@ export function Schedule({
   admin,
   open,
   create,
-  repeat,
   compact,
 }: Props) {
   const [mode, setMode] = useState<"day" | "week" | "month">(() =>
@@ -55,12 +52,20 @@ export function Schedule({
   const source = (
     onlyMine ? shifts.filter((s) => mineIds.has(s.id)) : shifts
   ).filter((s) => s.status !== "cancelled");
-  const staff = team.filter(
+  const staffById = new Map<string, { id: string; name: string; avatar_url?: string | null; archived?: boolean }>(team.map((user) => [user.id, user]));
+  for (const shift of source) {
+    if (shift.user_id && !staffById.has(shift.user_id)) staffById.set(shift.user_id, { id: shift.user_id, name: shift.user_name ?? "Сотрудник в архиве", avatar_url: shift.user_avatar_url, archived: true });
+  }
+  const staff = [...staffById.values()].filter(
     (u) =>
       (!onlyMine || mine.some((s) => s.user_id === u.id)) &&
       u.name.toLowerCase().includes(search.toLowerCase()),
   );
   const visibleDays = mode === "day" ? [anchor] : days;
+  const firstMonthDay = monthStart(anchor),
+    monthLength = Number(monthEnd(anchor).slice(-2)),
+    leadingCells = (new Date(firstMonthDay).getUTCDay() + 6) % 7,
+    trailingCells = (7 - (leadingCells + monthLength) % 7) % 7;
   const dateTitle =
     mode === "month"
       ? label(anchor, { month: "long", year: "numeric" })
@@ -142,12 +147,6 @@ export function Schedule({
                 {onlyMine ? "Мои смены" : "Вся команда"}
               </button>
             )}
-            {repeat && admin && (
-              <button className="btn tiny" onClick={() => repeat(start)}>
-                <Copy size={14} />
-                Повторить неделю
-              </button>
-            )}
             <label className="search-input">
               <Search size={15} />
               <input
@@ -168,12 +167,17 @@ export function Schedule({
             ))}
           </div>
           <div className="month-grid">
-            {Array.from({ length: 42 }, (_, i) =>
-              addDays(weekStart(monthStart(anchor)), i),
-            ).map((day) => (
+            {Array.from({ length: leadingCells }, (_, index) => (
+              <div key={`before-${index}`} className="month-placeholder" aria-hidden="true" />
+            ))}
+            {Array.from({ length: monthLength }, (_, i) =>
+              addDays(firstMonthDay, i),
+            ).map((day, index) => (
               <div
                 key={day}
-                className={`month-cell ${day.slice(0, 7) !== anchor.slice(0, 7) ? "outside" : ""} ${day === today ? "is-today" : ""}`}
+                data-date={day}
+                className={`month-cell ${day === today ? "is-today" : ""}`}
+                style={index === 0 ? { gridColumnStart: (new Date(day).getUTCDay() + 6) % 7 + 1 } : undefined}
               >
                 <button
                   className="month-day"
@@ -217,6 +221,9 @@ export function Schedule({
                 )}
               </div>
             ))}
+            {Array.from({ length: trailingCells }, (_, index) => (
+              <div key={`after-${index}`} className="month-placeholder" aria-hidden="true" />
+            ))}
           </div>
         </>
       ) : (
@@ -250,6 +257,7 @@ export function Schedule({
                     <span>
                       <strong>{u.name}</strong>
                       <small>
+                        {u.archived && "В архиве · "}
                         {
                           source.filter(
                             (s) =>
@@ -269,7 +277,7 @@ export function Schedule({
                       {source
                         .filter((s) => s.user_id === u.id && s.date === day)
                         .map(chip)}
-                      {admin &&
+                      {admin && !u.archived &&
                         !source.some(
                           (s) => s.user_id === u.id && s.date === day,
                         ) && (
