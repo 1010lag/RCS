@@ -1,14 +1,8 @@
-export type TelegramHomeScreenStatus = "unsupported" | "unknown" | "added" | "missed";
 type TelegramWebApp = {
   initData: string;
   ready(): void;
   expand(): void;
   openTelegramLink(url: string): void;
-  isVersionAtLeast?(version: string): boolean;
-  addToHomeScreen?(): void;
-  checkHomeScreenStatus?(callback: (status: TelegramHomeScreenStatus) => void): void;
-  onEvent?(event: "homeScreenAdded" | "activated", callback: () => void): void;
-  offEvent?(event: "homeScreenAdded" | "activated", callback: () => void): void;
   BackButton: { show(): void; hide(): void; onClick(fn: () => void): void; offClick(fn: () => void): void };
 };
 declare global { interface Window { Telegram?: { WebApp?: TelegramWebApp } } }
