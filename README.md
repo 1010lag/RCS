@@ -12,6 +12,7 @@
 - [Исходное задание](docs/ORIGINAL_REQUIREMENTS.txt).
 - [Android-приложение: APK, подключение к серверу и сборка](docs/ANDROID.md).
 - [Публичный сервер Render + Supabase и перенос данных](docs/HOSTING.md).
+- [Приложение в Telegram и уведомления бота](docs/TELEGRAM.md).
 
 ## Быстрый запуск
 

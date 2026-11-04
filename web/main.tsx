@@ -6,6 +6,8 @@ import { NativeShell } from "./NativeShell";
 import "./styles.css";
 import "./theme.css";
 import { initializeTheme } from "./theme";
+import { initializeTelegram } from "./telegram";
+await initializeTelegram();
 initializeTheme();
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode>

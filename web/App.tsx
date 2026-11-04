@@ -84,6 +84,8 @@ import { AvatarSettings } from "./AvatarSettings";
 import { BatchShiftForm } from "./BatchShiftForm";
 import { canTakeExchangeAt } from "../shared/exchange-window";
 import { PushControls } from "./PushControls";
+import { TelegramControls } from "./TelegramControls";
+import { telegramApp } from "./telegram";
 import { registerPushDevice, clearPushRegistration } from "./push-client";
 import { nativeApp, serverBase } from "./runtime";
 type View =
@@ -199,6 +201,12 @@ export function App() {
   useEffect(() => {
     let live = true;
     api("/auth/me")
+      .catch(async e => {
+        const telegram = telegramApp();
+        if (!(e instanceof ApiError) || e.status !== 401 || !telegram) throw e;
+        await api("/auth/telegram", "POST", { init_data: telegram.initData });
+        return api("/auth/me");
+      })
       .then((result) => {
         if (!live) return;
         setCsrf(result.csrf);
@@ -1568,6 +1576,7 @@ export function App() {
                           />
                         </label>
                       ))}
+                    <TelegramControls userId={user.id} offline={offline} report={setToast} />
                     <PushControls
                       key={user.version}
                       userId={user.id}

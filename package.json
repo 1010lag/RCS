@@ -15,6 +15,7 @@
     "demo": "tsx server/seed.ts",
     "admin": "tsx server/bootstrap.ts",
     "push:setup": "tsx scripts/setup-push.ts",
+    "telegram:setup": "tsx scripts/setup-telegram.ts",
     "android:sync": "npm run build && cap sync android",
     "android:build": "powershell -ExecutionPolicy Bypass -File scripts/build-android.ps1",
     "android:install": "powershell -ExecutionPolicy Bypass -File scripts/install-android.ps1",

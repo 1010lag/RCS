@@ -105,12 +105,35 @@ UPDATE adjustments a SET credit_amount=CASE WHEN x.minutes=0 THEN x.amount WHEN 
 -- statement
 CREATE INDEX IF NOT EXISTS adjustments_owner ON adjustments(shift_id,user_id);
 -- statement
+CREATE TABLE IF NOT EXISTS telegram_accounts (
+ id uuid NOT NULL DEFAULT gen_random_uuid() UNIQUE,
+ user_id uuid PRIMARY KEY REFERENCES users(id), chat_id text UNIQUE NOT NULL,
+ created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+-- statement
+CREATE TABLE IF NOT EXISTS telegram_links (
+ token_hash text PRIMARY KEY, user_id uuid UNIQUE NOT NULL REFERENCES users(id), expires_at timestamptz NOT NULL
+);
+-- statement
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS telegram_account_id uuid REFERENCES telegram_accounts(id) ON DELETE CASCADE;
+-- statement
+CREATE TABLE IF NOT EXISTS telegram_deliveries (
+ id uuid PRIMARY KEY DEFAULT gen_random_uuid(), notification_id uuid NOT NULL REFERENCES notifications(id),
+ account_id uuid NOT NULL REFERENCES telegram_accounts(id) ON DELETE CASCADE,
+ attempts integer NOT NULL DEFAULT 0, sent_at timestamptz, next_attempt timestamptz NOT NULL DEFAULT clock_timestamp(),
+ last_error text, UNIQUE(notification_id,account_id)
+);
+-- statement
+CREATE INDEX IF NOT EXISTS telegram_delivery_pending ON telegram_deliveries(next_attempt) WHERE sent_at IS NULL AND attempts<8;
+-- statement
+CREATE TABLE IF NOT EXISTS telegram_updates (id bigint PRIMARY KEY, created_at timestamptz NOT NULL DEFAULT clock_timestamp());
+-- statement
 -- RCS authorizes requests in its own server. Hosted Supabase's generated Data
 -- API must never expose these tables to its anonymous or browser-auth roles.
 DO $$
 DECLARE table_name text; api_role text;
 BEGIN
-  FOREACH table_name IN ARRAY ARRAY['users','sessions','shift_types','shifts','exchange_listings','adjustments','notifications','preferences','push_devices','deliveries','audit_logs','events','idempotency','request_limits'] LOOP
+  FOREACH table_name IN ARRAY ARRAY['users','sessions','shift_types','shifts','exchange_listings','adjustments','notifications','preferences','push_devices','deliveries','audit_logs','events','idempotency','request_limits','telegram_accounts','telegram_links','telegram_deliveries','telegram_updates'] LOOP
     EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', table_name);
     EXECUTE format('REVOKE ALL PRIVILEGES ON TABLE %I FROM PUBLIC', table_name);
     FOREACH api_role IN ARRAY ARRAY['anon','authenticated'] LOOP

@@ -147,6 +147,10 @@ export async function notify(
         "INSERT INTO deliveries(id,notification_id,device_id) SELECT gen_random_uuid(),$1,d.id FROM push_devices d LEFT JOIN preferences p ON p.user_id=d.user_id WHERE d.user_id=$2 AND COALESCE((to_jsonb(p)->>$3)::boolean,true) ON CONFLICT DO NOTHING",
         [id, user, category],
       );
+      await sql.query(
+        "INSERT INTO telegram_deliveries(notification_id,account_id) SELECT $1,a.id FROM telegram_accounts a LEFT JOIN preferences p ON p.user_id=a.user_id WHERE a.user_id=$2 AND COALESCE((to_jsonb(p)->>$3)::boolean,true) ON CONFLICT DO NOTHING",
+        [id, user, category],
+      );
     }
   }
 }

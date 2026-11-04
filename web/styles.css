@@ -2984,3 +2984,6 @@ table tbody tr:last-child td {
 }
 
 .native-connect{min-height:100dvh;display:flex;flex-direction:column;align-items:center;justify-content:center;max-width:440px;padding:35px 25px;margin:auto;text-align:center}.native-connect>.brand{margin-bottom:40px}.native-connect-icon{height:70px;width:70px;border-radius:18px;background:var(--accent-surface, #fff0ed);color:var(--accent, var(--red));display:grid;place-items:center;margin-bottom:24px}.native-connect h1{font-size:24px;letter-spacing:-.7px}.native-connect p{font-size:13px;color:var(--text-muted, #92929d);margin-bottom:28px}.native-connect form{width:100%;text-align:left}.native-connect .btn{margin-bottom:12px;min-height:46px;font-size:13px}.native-connect small{font-size:11px;color:var(--text-muted, #9b9ba6);line-height:1.6;display:block;margin-top:15px}.native-connect input{font-size:16px}
+html.telegram-app { min-height: var(--tg-viewport-stable-height, 100%); }
+.telegram-connect { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.telegram-connect p { flex-basis: 100%; margin-bottom: 0; }

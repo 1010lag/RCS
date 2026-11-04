@@ -1,9 +1,12 @@
 import { firebasePush, invalidPushToken, platformPushReady, type PushGateway } from "./push";
 import type { Database } from "./db";
 import { audit, notify, admins, uid } from "./domain";
-export async function tick(db: Database, push: PushGateway = firebasePush) {
+import { deliverTelegram, telegramBot, type TelegramGateway } from "./telegram";
+export async function tick(db: Database, push: PushGateway = firebasePush, telegram: TelegramGateway = telegramBot) {
   await db.tx(async (sql) => {
     await sql.query("DELETE FROM sessions WHERE expires_at<=clock_timestamp()");
+    await sql.query("DELETE FROM telegram_links WHERE expires_at<=clock_timestamp()");
+    await sql.query("DELETE FROM telegram_updates WHERE created_at<clock_timestamp()-interval '7 days'");
     await sql.query("DELETE FROM request_limits WHERE resets_at<clock_timestamp()-interval '1 day'");
     // These administrative edits are audit-only. Do not send old queued
     // notifications when push is enabled for the first time.
@@ -82,6 +85,7 @@ export async function tick(db: Database, push: PushGateway = firebasePush) {
         `uncovered:${s.id}`,
       );
   });
+  await deliverTelegram(db, telegram);
   const pushSettings = await push.settings();
   if (!pushSettings.ready) return;
   // One API process owns delivery in the initial deployment. DB events remain durable.
@@ -142,7 +146,7 @@ export async function tick(db: Database, push: PushGateway = firebasePush) {
     }
   }
 }
-export async function nextWorkerDelay(db: Database, maxIdleMs: number, push: PushGateway = firebasePush) {
+export async function nextWorkerDelay(db: Database, maxIdleMs: number, push: PushGateway = firebasePush, telegram: TelegramGateway = telegramBot) {
   const settings = await push.settings();
   const rows = await db.query(`
     WITH deadlines AS (
@@ -164,10 +168,16 @@ export async function nextWorkerDelay(db: Database, maxIdleMs: number, push: Pus
       JOIN users u ON u.id=n.user_id AND u.active LEFT JOIN preferences pref ON pref.user_id=n.user_id
       WHERE ((p.platform='android' AND $1::boolean) OR (p.platform='web' AND $2::boolean))
         AND d.sent_at IS NULL AND d.attempts<8 AND COALESCE((to_jsonb(pref)->>n.category)::boolean,true)
+      UNION ALL
+      SELECT d.next_attempt FROM telegram_deliveries d JOIN telegram_accounts a ON a.id=d.account_id
+      JOIN notifications n ON n.id=d.notification_id AND n.user_id=a.user_id
+      JOIN users u ON u.id=a.user_id AND u.active AND NOT u.must_change_password
+      LEFT JOIN preferences p ON p.user_id=u.id
+      WHERE $4::boolean AND d.sent_at IS NULL AND d.attempts<8 AND COALESCE((to_jsonb(p)->>n.category)::boolean,true)
     )
     SELECT GREATEST(1000, LEAST($3::double precision,
       COALESCE(EXTRACT(EPOCH FROM(min(deadline)-clock_timestamp()))*1000,$3::double precision))) AS delay_ms
-    FROM deadlines`, [platformPushReady(settings, "android"), platformPushReady(settings, "web"), maxIdleMs]);
+    FROM deadlines`, [platformPushReady(settings, "android"), platformPushReady(settings, "web"), maxIdleMs, telegram.ready()]);
   return Math.ceil(Number(rows[0].delay_ms));
 }
 

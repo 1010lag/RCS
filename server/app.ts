@@ -13,6 +13,7 @@ import type { Database, Sql } from "./db";
 import type { User } from "../shared/types";
 import { canTakeExchangeAt, exchangeDeadline } from "../shared/exchange-window";
 import { firebasePush, invalidPushToken, platformPushReady, type PushGateway } from "./push";
+import { clearTelegram, createTelegramLink, handleTelegramUpdate, telegramBot, telegramSettings, validWebhookSecret, validateTelegramData, type TelegramGateway } from "./telegram";
 import {
   Problem,
   fail,
@@ -100,9 +101,11 @@ const shiftSchema = z.object({
 });
 export async function createApp(
   db: Database,
-  options: { logger?: boolean; clock?: () => Date; push?: PushGateway; onMutation?: () => void } = {},
+  options: { logger?: boolean; clock?: () => Date; push?: PushGateway; telegram?: TelegramGateway; onMutation?: () => void } = {},
 ) {
   const push = options.push ?? firebasePush;
+  const telegram = options.telegram ?? telegramBot;
+  const sessionSameSite = () => process.env.NODE_ENV === "production" && telegramSettings().ready ? "none" as const : "strict" as const;
   const cpu = new ResourceGate(2, 4), requests = new ResourceGate(48), usersBudget = new MemoryBudget();
   const dummyPasswordHash = await hash(randomBytes(32).toString("hex"));
   const app = Fastify({
@@ -194,7 +197,9 @@ export async function createApp(
   app.addHook("onSend", async (_req, reply) => {
     reply.header("X-Content-Type-Options", "nosniff");
     reply.header("Referrer-Policy", "same-origin");
-    reply.header("X-Frame-Options", "DENY");
+    if (telegramSettings().ready) {
+      reply.header("Content-Security-Policy", "frame-ancestors 'self' https://web.telegram.org https://*.web.telegram.org https://telegram.org https://*.telegram.org");
+    } else reply.header("X-Frame-Options", "DENY");
     reply.header("Cache-Control", "no-store");
   });
   const originCheck = (req: FastifyRequest) => {
@@ -258,13 +263,14 @@ export async function createApp(
   }
   async function rotateSessions(sql: Sql, userId: string) {
     const token = randomBytes(32).toString("hex"), csrf = randomBytes(24).toString("hex");
+    await clearTelegram(sql, userId);
     await sql.query("DELETE FROM sessions WHERE user_id=$1", [userId]);
     await sql.query("INSERT INTO sessions(id,user_id,csrf,expires_at) VALUES($1,$2,$3,clock_timestamp()+interval '7 days')", [digest(token), userId, csrf]);
     return { token, csrf };
   }
   function applySession(reply: FastifyReply, session: { token: string; csrf: string }) {
     reply.header("X-CSRF-Token", session.csrf).setCookie("rcs_session", session.token, {
-      httpOnly: true, sameSite: "strict", secure: process.env.NODE_ENV === "production", path: "/", maxAge: 604800,
+      httpOnly: true, sameSite: sessionSameSite(), secure: process.env.NODE_ENV === "production", path: "/", maxAge: 604800,
     });
   }
   const range = (req: FastifyRequest) => {
@@ -276,6 +282,54 @@ export async function createApp(
     );
   };
   app.get("/api/health", async () => ({ ok: true }));
+  app.post("/api/telegram/webhook", async (req, reply) => {
+    if (!telegram.ready() || !validWebhookSecret(req.headers["x-telegram-bot-api-secret-token"]))
+      fail("FORBIDDEN", "Доступ запрещён", 403);
+    await handleTelegramUpdate(db, req.body, telegram);
+    return { ok: true };
+  });
+  app.post("/api/auth/telegram", async (req, reply) => {
+    originCheck(req);
+    if (!telegram.ready()) fail("TELEGRAM_UNCONFIGURED", "Telegram ещё не подключён", 503);
+    await consumeBudget(db, budgetKey("telegram-login-ip", req.ip), 30, 60000);
+    const body = z.object({ init_data: z.string().min(1).max(16384) }).parse(req.body);
+    const chat = validateTelegramData(body.init_data);
+    await consumeBudget(db, budgetKey("telegram-login-user", chat), 10, 60000);
+    const token = randomBytes(32).toString("hex"), csrf = randomBytes(24).toString("hex");
+    const user = await db.tx(async sql => {
+      const account = (await sql.query("SELECT u.*,a.id AS account_id FROM telegram_accounts a JOIN users u ON u.id=a.user_id WHERE a.chat_id=$1 AND u.active AND NOT u.must_change_password FOR SHARE OF a,u", [chat]))[0];
+      if (!account) fail("TELEGRAM_NOT_LINKED", "Войдите по телефону и подключите Telegram в профиле", 401);
+      await sql.query("INSERT INTO sessions(id,user_id,csrf,expires_at,telegram_account_id) VALUES($1,$2,$3,clock_timestamp()+interval '7 days',$4)", [digest(token), account.id, csrf, account.account_id]);
+      return publicUser(account);
+    });
+    applySession(reply, { token, csrf });
+    return { user, csrf, server_now: (await time(db)).toISOString() };
+  });
+  route("GET", "/me/telegram", async req => {
+    const settings = telegramSettings();
+    const account = (await db.query("SELECT created_at FROM telegram_accounts WHERE user_id=$1", [req.user.id]))[0];
+    return { configured: settings.ready, connected: Boolean(account), bot_url: settings.botUrl, connected_at: account?.created_at ?? null };
+  });
+  route("POST", "/me/telegram/link", async req => {
+    await consumeBudget(db, budgetKey("telegram-link", req.user.id), 5, 5 * 60000);
+    return createTelegramLink(db, req.user.id);
+  });
+  route("DELETE", "/me/telegram", async req => {
+    await db.tx(sql => clearTelegram(sql, req.user.id));
+    return { ok: true };
+  });
+  route("POST", "/me/telegram/test", async req => {
+    if (!telegram.ready()) fail("TELEGRAM_UNCONFIGURED", "Telegram ещё не подключён", 503);
+    await consumeBudget(db, budgetKey("telegram-test", req.user.id), 3, 5 * 60000);
+    return db.tx(async sql => {
+      const account = (await sql.query("SELECT id FROM telegram_accounts WHERE user_id=$1", [req.user.id]))[0];
+      if (!account) fail("TELEGRAM_NOT_LINKED", "Сначала подключите Telegram в профиле", 409);
+      const id = uid();
+      await sql.query("INSERT INTO notifications(id,user_id,title,body,category,link) VALUES($1,$2,'Проверка Telegram','Бот подключён. Уведомления RCS приходят сюда.','test','profile')", [id, req.user.id]);
+      await sql.query("INSERT INTO telegram_deliveries(notification_id,account_id) VALUES($1,$2)", [id, account.id]);
+      return { accepted: true };
+    });
+  });
   app.post(
     "/api/auth/login",
     async (req, reply) => {
@@ -305,7 +359,7 @@ export async function createApp(
       );
       reply.setCookie("rcs_session", token, {
         httpOnly: true,
-        sameSite: "strict",
+        sameSite: sessionSameSite(),
         secure: process.env.NODE_ENV === "production",
         path: "/",
         maxAge: 604800,
@@ -485,7 +539,10 @@ export async function createApp(
         if (sensitive) {
           if (!b.active) fail("INACTIVE_USER", "Для смены данных сначала восстановите сотрудника");
           if (id === req.user.id) replacement = await rotateSessions(sql, id);
-          else await sql.query("DELETE FROM sessions WHERE user_id=$1", [id]);
+          else {
+            await clearTelegram(sql, id);
+            await sql.query("DELETE FROM sessions WHERE user_id=$1", [id]);
+          }
           await sql.query("DELETE FROM push_devices WHERE user_id=$1", [id]);
         }
         if (b.password && await cpu.run(() => verify(old.password_hash, b.password!)))
@@ -522,6 +579,7 @@ export async function createApp(
           }
           const remaining = await sql.query("SELECT shift_id FROM exchange_listings WHERE listed_by=$1 AND status='open'", [id]);
           for (const listing of remaining) await closeListing(sql, listing.shift_id);
+          await clearTelegram(sql, id);
           await sql.query("DELETE FROM sessions WHERE user_id=$1", [id]);
           await sql.query("DELETE FROM push_devices WHERE user_id=$1", [id]);
         }

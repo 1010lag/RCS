@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { Database, Sql } from "./db";
 
 // Parents precede their dependents. Sessions and device bindings remain linked.
-const tables = ["users", "sessions", "shift_types", "shifts", "exchange_listings", "adjustments", "notifications", "preferences", "push_devices", "deliveries", "audit_logs", "events", "idempotency", "request_limits"] as const;
+const tables = ["users", "telegram_accounts", "sessions", "shift_types", "shifts", "exchange_listings", "adjustments", "notifications", "preferences", "push_devices", "deliveries", "audit_logs", "events", "idempotency", "request_limits", "telegram_links", "telegram_deliveries", "telegram_updates"] as const;
 const backupSchema = z.object({
   format: z.literal("rcs-database-v1"),
   createdAt: z.string(),
