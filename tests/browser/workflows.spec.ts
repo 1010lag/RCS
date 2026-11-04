@@ -819,7 +819,8 @@ test("admin payroll shows only employee monthly hours and salary", async ({ page
   await expect(page.locator(".month-pager")).toBeVisible();
 });
 test("signing in as a different account starts at Today with the personal cards", async ({ page }) => {
-  await regressionSession(page);
+  await page.context().setExtraHTTPHeaders({ "X-Forwarded-For": "127.30.0.1" });
+  await page.context().addCookies([{ name: "rcs_session", value: "logout-ui-test-session", url: "http://127.0.0.1:3181", httpOnly: true, sameSite: "Strict" }]);
   await page.goto("/#profile");
   await page.getByRole("button", { name: "Выйти из аккаунта" }).click();
   await page.getByLabel("Телефон", { exact: true }).fill("80 29 999 99 71");
@@ -851,7 +852,8 @@ test("Tomorrow includes the next month when the current calendar grid ends today
   await expect(tomorrow).toContainText("08:00–12:00");
 });
 test("an admin can cancel or confirm audit cleanup without changing shifts", async ({ page }) => {
-  await page.context().addCookies([{ name: "rcs_session", value: "calendar-ui-test-session", url: "http://127.0.0.1:3181", httpOnly: true, sameSite: "Strict" }]);
+  await page.context().setExtraHTTPHeaders({ "X-Forwarded-For": "127.30.0.2" });
+  await page.context().addCookies([{ name: "rcs_session", value: "audit-ui-test-session", url: "http://127.0.0.1:3181", httpOnly: true, sameSite: "Strict" }]);
   await page.goto("/#audit");
   const before = (await (await page.request.get("/api/audit-logs")).json()).map((row: any) => row.id);
   await page.getByRole("button", { name: "Очистить журнал", exact: true }).click();
@@ -872,7 +874,8 @@ test("an admin can cancel or confirm audit cleanup without changing shifts", asy
   expect(await (await page.request.get(url)).json()).toEqual(shifts);
 });
 test("schedule grid rows stay aligned with multiple and cancelled shifts in light and dark themes", async ({ page }) => {
-  await page.context().addCookies([{ name: "rcs_session", value: "calendar-ui-test-session", url: "http://127.0.0.1:3181", httpOnly: true, sameSite: "Strict" }]);
+  await page.context().setExtraHTTPHeaders({ "X-Forwarded-For": "127.30.0.3" });
+  await page.context().addCookies([{ name: "rcs_session", value: "grid-ui-test-session", url: "http://127.0.0.1:3181", httpOnly: true, sameSite: "Strict" }]);
   const team = await (await page.request.get("/api/team")).json();
   const me = await (await page.request.get("/api/auth/me")).json();
   const date = me.server_now.slice(0, 10);
