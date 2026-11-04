@@ -87,6 +87,7 @@ import { BatchShiftForm } from "./BatchShiftForm";
 import { canTakeExchangeAt } from "../shared/exchange-window";
 import { PushControls } from "./PushControls";
 import { TelegramControls } from "./TelegramControls";
+import { TelegramHomeScreen } from "./TelegramHomeScreen";
 import { Recipes } from "./Recipes";
 import { telegramApp } from "./telegram";
 import { registerPushDevice, clearPushRegistration } from "./push-client";
@@ -661,6 +662,7 @@ export function App() {
         </div>
         <div className="nav-heading">РАБОЧЕЕ ПРОСТРАНСТВО</div>
         <nav>
+          <TelegramHomeScreen compact />
           {navItems
             .filter(
               ([id]) =>
@@ -1600,6 +1602,7 @@ export function App() {
                           />
                         </label>
                       ))}
+                    <TelegramHomeScreen />
                     <TelegramControls userId={user.id} offline={offline} report={setToast} />
                     <PushControls
                       key={user.version}
