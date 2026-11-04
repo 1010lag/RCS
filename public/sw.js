@@ -92,7 +92,7 @@ self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   const link = event.notification.data?.link || "notifications";
   const safe =
-    /^(shift:[a-f0-9-]+|home|schedule|exchange|payroll|notifications|profile|employees|types)$/.test(
+    /^(shift:[a-f0-9-]+|home|schedule|exchange|recipes|payroll|notifications|profile|employees|types)$/.test(
       link,
     )
       ? link

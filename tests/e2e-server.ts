@@ -5,6 +5,9 @@ import fastifyStatic from "@fastify/static";
 import { openDatabase } from "../server/db";
 import { createApp } from "../server/app";
 import { uid, localDate, dateTime, notify } from "../server/domain";
+// Give collaboration scenarios separate loopback client IPs while exercising
+// the normal production request limits, without sharing a single test budget.
+process.env.TRUSTED_PROXIES = "127.0.0.1,::1";
 const db = await openDatabase(":memory:"),
   ids = [uid(), uid(), uid()],
   type = uid(),
@@ -47,6 +50,16 @@ await db.tx(async (sql) => {
     [uid(), id, ids[1], dateTime(future, "08:00")],
   );
   const nativeDay = new Date(Date.parse(today) + 6 * 86400000).toISOString().slice(0, 10);
+  // Recipe collaboration gets its own users so its realtime requests do not
+  // exhaust the per-user limits shared by the existing layout scenarios.
+  for (const [index, role] of ["admin", "barista"].entries()) {
+    const recipeUser = uid();
+    await sql.query("INSERT INTO users(id,name,phone,role,password_hash,rate) VALUES($1,$2,$3,$4,$5,12)", [recipeUser, `Рецепты ${role}`, `+37529999996${index}`, role, password]);
+    await sql.query("INSERT INTO sessions(id,user_id,csrf,expires_at) VALUES($1,$2,'recipes-test-csrf',clock_timestamp()+interval '1 hour')", [createHash("sha256").update(`recipes-test-${role}`).digest("hex"), recipeUser]);
+  }
+  const telegramUser = uid();
+  await sql.query("INSERT INTO users(id,name,phone,role,password_hash,rate) VALUES($1,'Telegram тест','+375299999959','barista',$2,12)", [telegramUser, password]);
+  await sql.query("INSERT INTO sessions(id,user_id,csrf,expires_at) VALUES($1,$2,'telegram-test-csrf',clock_timestamp()+interval '1 hour')", [createHash("sha256").update("telegram-test-session").digest("hex"), telegramUser]);
   // A test-only session keeps this layout scenario independent of login throttling.
   await sql.query(
     "INSERT INTO sessions(id,user_id,csrf,expires_at) VALUES($1,$2,$3,clock_timestamp()+interval '1 hour')",

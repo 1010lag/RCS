@@ -1,15 +1,6 @@
 name: Android APK
 on:
   workflow_dispatch:
-  push:
-    paths:
-      [
-        "web/**",
-        "shared/**",
-        "android/**",
-        "package*.json",
-        "capacitor.config.ts",
-      ]
 permissions:
   contents: read
 jobs:

@@ -43,6 +43,7 @@ import {
   Ellipsis,
   CheckCircle2,
   Trash2,
+  BookOpen,
 } from "lucide-react";
 import type {
   User,
@@ -52,6 +53,7 @@ import type {
   Notice,
   PayrollRow,
   Audit,
+  Recipe,
 } from "../shared/types";
 import { statusLabels } from "../shared/types";
 import {
@@ -85,6 +87,7 @@ import { BatchShiftForm } from "./BatchShiftForm";
 import { canTakeExchangeAt } from "../shared/exchange-window";
 import { PushControls } from "./PushControls";
 import { TelegramControls } from "./TelegramControls";
+import { Recipes } from "./Recipes";
 import { telegramApp } from "./telegram";
 import { registerPushDevice, clearPushRegistration } from "./push-client";
 import { nativeApp, serverBase } from "./runtime";
@@ -92,6 +95,7 @@ type View =
   | "home"
   | "schedule"
   | "exchange"
+  | "recipes"
   | "employees"
   | "types"
   | "payroll"
@@ -106,6 +110,7 @@ type Snapshot = {
   listings: Listing[];
   notices: Notice[];
   payroll: PayrollRow[];
+  recipes: Recipe[];
   synced: string;
 };
 type Modal =
@@ -129,6 +134,7 @@ const titles: Record<View, string> = {
   home: "Обзор",
   schedule: "График смен",
   exchange: "Биржа смен",
+  recipes: "Рецепты альтернативы",
   employees: "Команда",
   types: "Типы смен",
   payroll: "Часы и начисления",
@@ -140,6 +146,7 @@ const navItems: [View, string, any][] = [
   ["home", "Обзор", LayoutDashboard],
   ["schedule", "График смен", CalendarDays],
   ["exchange", "Биржа смен", ArrowLeftRight],
+  ["recipes", "Рецепты альтернативы", BookOpen],
   ["employees", "Команда", Users],
   ["types", "Типы смен", Layers],
   ["payroll", "Расчёты", Wallet],
@@ -154,6 +161,7 @@ const empty: Snapshot = {
   listings: [],
   notices: [],
   payroll: [],
+  recipes: [],
   synced: "",
 };
 export function App() {
@@ -178,6 +186,8 @@ export function App() {
     [config, setConfig] = useState<any>(null),
     [menu, setMenu] = useState(false);
   const timeBase = useRef({ server: Date.now(), local: performance.now() }),
+    recipesRequested = useRef(false),
+    recipesCache = useRef<Recipe[] | null>(null),
     requestSeq = useRef(0),
     pendingMutation = useRef<Promise<any> | null>(null),
     activeUser = useRef<string | null>(null);
@@ -263,7 +273,13 @@ export function App() {
           .catch((e) => setError(e.message));
         return;
       }
-      if (part in titles) setView(part as View);
+      if (part in titles) {
+        setView(part as View);
+        if (part === "recipes" && !recipesRequested.current) {
+          recipesRequested.current = true;
+          void load();
+        }
+      }
     };
     update();
     window.addEventListener("hashchange", update);
@@ -294,7 +310,7 @@ export function App() {
       to = anchor.slice(0, 7) === minskDate(now).slice(0, 7) && tomorrow > gridTo ? tomorrow : gridTo,
       range = `from=${from}&to=${to}`;
     try {
-      const [shifts, mine, team, types, listings, notices, payroll, me] =
+      const [shifts, mine, team, types, listings, notices, payroll, me, recipes] =
         await Promise.all([
           api<Shift[]>("/schedule?" + range),
           api<Shift[]>("/me/shifts?" + range),
@@ -304,8 +320,12 @@ export function App() {
           api<Notice[]>("/notifications"),
           api<PayrollRow[]>((isAdmin ? "/payroll?" : "/me/payroll?") + range),
           api("/auth/me"),
+          recipesRequested.current ? api<Recipe[]>("/recipes") : recipesCache.current !== null
+            ? Promise.resolve(recipesCache.current)
+            : cacheRead(id).then(cached => cached?.recipes ?? []).catch(() => []),
         ]);
       if (seq !== requestSeq.current || activeUser.current !== id) return;
+      recipesCache.current = recipes;
       const snapshot = {
         shifts,
         mine,
@@ -314,6 +334,7 @@ export function App() {
         listings,
         notices,
         payroll,
+        recipes,
         synced: me.server_now,
       };
       setData(snapshot);
@@ -450,6 +471,8 @@ export function App() {
   async function forget() {
     void clearPushRegistration(config);
     activeUser.current = null;
+    recipesRequested.current = false;
+    recipesCache.current = null;
     requestSeq.current++;
     setUser(null);
     setData(empty);
@@ -1028,6 +1051,7 @@ export function App() {
                   }
                 />
               )}
+              {view === "recipes" && <Recipes recipes={data.recipes ?? []} offline={offline} onChanged={load} report={setToast} />}
               {view === "exchange" && (
                 <>
                   <div className="info-strip">
@@ -1642,6 +1666,7 @@ export function App() {
               ["home", "Сегодня", Coffee],
               ["schedule", "График", CalendarDays],
               ["exchange", "Биржа", ArrowLeftRight],
+              ["recipes", "Рецепты", BookOpen],
               ["profile", "Профиль", Users],
             ] as const
           ).map(([id, title, Icon]) => (
@@ -1689,6 +1714,7 @@ const subtitles: Record<View, string> = {
   home: "",
   schedule: "Планируйте смены. Держите команду в одном ритме.",
   exchange: "Помогайте друг другу и выбирайте удобные смены.",
+  recipes: "Общая коллекция рецептов. Добавляйте любимые и пробуйте новое.",
   employees: "Люди, на которых держится наша кофейня.",
   types: "Настройте время, оплату и правила для каждой смены.",
   payroll: "Прозрачный расчёт времени и оплаты в белорусских рублях.",

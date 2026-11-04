@@ -1,4 +1,20 @@
 export type Role = "admin" | "barista";
+export const recipeMethods = { aeropress: "Аэропресс", v60: "V60", bonavita: "Бонавита" } as const;
+export type RecipeMethod = keyof typeof recipeMethods;
+export interface Recipe {
+  id: string;
+  method: RecipeMethod;
+  title: string;
+  coffee: string;
+  water: string;
+  temperature: string;
+  grind: string;
+  brew_time: string;
+  instructions: string;
+  created_by: string;
+  author_name: string;
+  created_at: string;
+}
 export type PayType = "hourly" | "shift";
 export type ShiftStatus =
   "planned" | "confirmed" | "worked" | "closed" | "cancelled";

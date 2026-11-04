@@ -23,7 +23,7 @@ export function initializeTelegram() {
         if (new URLSearchParams(location.hash.slice(1)).has("tgWebAppData")) {
           query.delete("tg_target");
           const search = query.size ? `?${query}` : "";
-          const view = /^(shift:[a-f0-9-]+|home|schedule|exchange|payroll|notifications|profile)$/.test(target) ? target : "home";
+          const view = /^(shift:[a-f0-9-]+|home|schedule|exchange|recipes|payroll|notifications|profile)$/.test(target) ? target : "home";
           history.replaceState(null, "", `${location.pathname}${search}#${view}`);
         }
         const back = () => { location.hash = "home"; };

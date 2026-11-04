@@ -282,6 +282,32 @@ export async function createApp(
     );
   };
   app.get("/api/health", async () => ({ ok: true }));
+  route("GET", "/recipes", () => db.query(
+    "SELECT r.id,r.method,r.title,r.coffee,r.water,r.temperature,r.grind,r.brew_time,r.instructions,r.created_by,u.name AS author_name,r.created_at FROM recipes r JOIN users u ON u.id=r.created_by WHERE r.deleted_at IS NULL ORDER BY r.created_at DESC,r.id DESC",
+  ));
+  route("POST", "/recipes", async req => {
+    const parameter = z.string().trim().max(80).default("");
+    const body = z.object({
+      method: z.enum(["aeropress", "v60", "bonavita"]),
+      title: z.string().trim().min(1, "Добавьте название рецепта").max(120),
+      coffee: parameter, water: parameter, temperature: parameter, grind: parameter, brew_time: parameter,
+      instructions: z.string().trim().min(1, "Опишите приготовление").max(8000),
+    }).parse(req.body);
+    return db.tx(async sql => {
+      const id = uid();
+      await sql.query("INSERT INTO recipes(id,method,title,coffee,water,temperature,grind,brew_time,instructions,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+        [id, body.method, body.title, body.coffee, body.water, body.temperature, body.grind, body.brew_time, body.instructions, req.user.id]);
+      await audit(sql, req.user.id, "Рецепт добавлен", "recipe", id, null, body);
+      return { id };
+    });
+  });
+  route("DELETE", "/recipes/:id", req => db.tx(async sql => {
+    const id = paramsId(req);
+    const recipe = (await sql.query("UPDATE recipes SET deleted_at=clock_timestamp() WHERE id=$1 AND deleted_at IS NULL RETURNING id,method,title,created_by", [id]))[0];
+    if (!recipe) fail("NOT_FOUND", "Рецепт уже удалён или не найден", 404);
+    await audit(sql, req.user.id, "Рецепт удалён", "recipe", id, recipe, { deleted: true });
+    return { ok: true };
+  }));
   app.post("/api/telegram/webhook", async (req, reply) => {
     if (!telegram.ready() || !validWebhookSecret(req.headers["x-telegram-bot-api-secret-token"]))
       fail("FORBIDDEN", "Доступ запрещён", 403);

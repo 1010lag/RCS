@@ -1,7 +1,7 @@
 import { test, expect } from "@playwright/test";
 
 test("profile connects Telegram, queues a test and disconnects", async ({ page, context }) => {
-  await context.addCookies([{ name: "rcs_session", value: "native-layout-test-session", url: "http://127.0.0.1:3181", httpOnly: true, sameSite: "Strict" }]);
+  await context.addCookies([{ name: "rcs_session", value: "telegram-test-session", url: "http://127.0.0.1:3181", httpOnly: true, sameSite: "Strict" }]);
   let connected = false, tested = false;
   await page.route("**/api/me/telegram", async route => {
     if (route.request().method() === "DELETE") connected = false;
@@ -23,7 +23,7 @@ test("profile connects Telegram, queues a test and disconnects", async ({ page, 
 });
 
 test("Mini App loads the SDK, expands and preserves the notification destination", async ({ page, context }) => {
-  await context.addCookies([{ name: "rcs_session", value: "native-layout-test-session", url: "http://127.0.0.1:3181", httpOnly: true, sameSite: "Strict" }]);
+  await context.addCookies([{ name: "rcs_session", value: "telegram-test-session", url: "http://127.0.0.1:3181", httpOnly: true, sameSite: "Strict" }]);
   await page.route("https://telegram.org/js/telegram-web-app.js", route => route.fulfill({
     contentType: "application/javascript", body: `window.telegramCalls=[]; window.Telegram={WebApp:{initData:'signed-launch-data',ready(){window.telegramCalls.push('ready')},expand(){window.telegramCalls.push('expand')},BackButton:{show(){window.telegramCalls.push('back-show')},hide(){},onClick(){},offClick(){}}}};`,
   }));

@@ -128,12 +128,23 @@ CREATE INDEX IF NOT EXISTS telegram_delivery_pending ON telegram_deliveries(next
 -- statement
 CREATE TABLE IF NOT EXISTS telegram_updates (id bigint PRIMARY KEY, created_at timestamptz NOT NULL DEFAULT clock_timestamp());
 -- statement
+CREATE TABLE IF NOT EXISTS recipes (
+ id uuid PRIMARY KEY, method text NOT NULL CHECK(method IN ('aeropress','v60','bonavita')),
+ title text NOT NULL CHECK(length(trim(title)) BETWEEN 1 AND 120),
+ coffee text NOT NULL DEFAULT '', water text NOT NULL DEFAULT '', temperature text NOT NULL DEFAULT '',
+ grind text NOT NULL DEFAULT '', brew_time text NOT NULL DEFAULT '',
+ instructions text NOT NULL CHECK(length(trim(instructions)) BETWEEN 1 AND 8000),
+ created_by uuid NOT NULL REFERENCES users(id), created_at timestamptz NOT NULL DEFAULT clock_timestamp(), deleted_at timestamptz
+);
+-- statement
+CREATE INDEX IF NOT EXISTS recipes_method ON recipes(method,created_at DESC) WHERE deleted_at IS NULL;
+-- statement
 -- RCS authorizes requests in its own server. Hosted Supabase's generated Data
 -- API must never expose these tables to its anonymous or browser-auth roles.
 DO $$
 DECLARE table_name text; api_role text;
 BEGIN
-  FOREACH table_name IN ARRAY ARRAY['users','sessions','shift_types','shifts','exchange_listings','adjustments','notifications','preferences','push_devices','deliveries','audit_logs','events','idempotency','request_limits','telegram_accounts','telegram_links','telegram_deliveries','telegram_updates'] LOOP
+  FOREACH table_name IN ARRAY ARRAY['users','sessions','shift_types','shifts','exchange_listings','adjustments','notifications','preferences','push_devices','deliveries','audit_logs','events','idempotency','request_limits','telegram_accounts','telegram_links','telegram_deliveries','telegram_updates','recipes'] LOOP
     EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', table_name);
     EXECUTE format('REVOKE ALL PRIVILEGES ON TABLE %I FROM PUBLIC', table_name);
     FOREACH api_role IN ARRAY ARRAY['anon','authenticated'] LOOP

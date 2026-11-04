@@ -164,7 +164,7 @@ export const firebasePush: PushGateway = {
   },
 };
 export function safePushLink(link: string) {
-  return /^(shift:[a-f0-9-]+|home|schedule|exchange|payroll|notifications|profile|employees|types|audit)$/.test(
+  return /^(shift:[a-f0-9-]+|home|schedule|exchange|recipes|payroll|notifications|profile|employees|types|audit)$/.test(
     link,
   )
     ? link

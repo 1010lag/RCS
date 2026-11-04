@@ -34,7 +34,7 @@ if (nativeApp) {
           const link = event.notification.data?.link;
           window.location.hash =
             typeof link === "string" &&
-            /^(shift:[a-f0-9-]+|home|schedule|exchange|payroll|notifications|profile)$/.test(
+            /^(shift:[a-f0-9-]+|home|schedule|exchange|recipes|payroll|notifications|profile)$/.test(
               link,
             )
               ? link
