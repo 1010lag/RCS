@@ -809,6 +809,12 @@ main {
 .table-scroll {
   overflow-x: auto;
 }
+.schedule-scroll {
+  max-height: 65vh;
+  max-height: 65dvh;
+  overflow: auto;
+  isolation: isolate;
+}
 table {
   border-collapse: collapse;
   width: 100%;
@@ -835,6 +841,8 @@ table tbody tr:last-child td {
 .schedule-table {
   table-layout: fixed;
   min-width: 850px;
+  border-collapse: separate;
+  border-spacing: 0;
 }
 .schedule-table th,
 .schedule-table td {
@@ -846,6 +854,9 @@ table tbody tr:last-child td {
   border-right: 0;
 }
 .schedule-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
   font-size: 8px;
   font-weight: 600;
   text-align: center;
@@ -864,6 +875,8 @@ table tbody tr:last-child td {
   position: relative;
 }
 .schedule-table th.person-heading {
+  left: 0;
+  z-index: 3;
   width: 186px;
   text-align: left;
   padding-left: 23px;
@@ -878,6 +891,9 @@ table tbody tr:last-child td {
   margin-left: 6px;
 }
 .schedule-table .person-cell {
+  position: sticky;
+  left: 0;
+  z-index: 1;
   display: table-cell;
   vertical-align: middle;
   height: 84px;
