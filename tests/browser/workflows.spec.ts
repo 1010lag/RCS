@@ -369,16 +369,13 @@ test("admin can cancel or confirm employee and shift type removal on mobile", as
   await dialog.getByRole("button", { name: "Удалить сотрудника", exact: true }).click();
   await expect(page.getByRole("status")).toContainText("Сотрудник удалён из команды");
   await expect(card).toHaveCount(0);
-  await expect(calendarShift).toHaveCount(1, { timeout: 5000 });
-  await expect(calendarShift).toContainText("Отменена");
+  await expect(calendarShift).toHaveCount(0, { timeout: 5000 });
   const schedule = await (await page.request.get(`/api/schedule?from=${scheduledDay}&to=${scheduledDay}`)).json();
-  expect(schedule.find((item: any) => item.id === shiftId).status).toBe("cancelled");
+  expect(schedule.some((item: any) => item.id === shiftId)).toBe(false);
   expect((await (await page.request.get(`/api/shifts/${shiftId}`)).json()).status).toBe("cancelled");
   await calendarPage.close();
-  await page.getByRole("button", { name: "Архив сотрудников", exact: true }).click();
-  await expect(card).toContainText("В архиве");
-  await page.screenshot({ path: ".data/qa/employee-archive.png", fullPage: true });
-  await page.getByRole("button", { name: "Показать команду", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Архив сотрудников", exact: true })).toHaveCount(0);
+  expect((await (await page.request.get("/api/employees")).json()).some((item: any) => item.id === employee.id)).toBe(false);
   await page.getByRole("button", { name: "Открыть меню", exact: true }).click();
   await page.locator(".sidebar").getByRole("button", { name: "Типы смен", exact: true }).click();
   const typeCard = page.locator(".type-card").filter({ has: page.getByRole("heading", { name: "Тестовый тип удаления", exact: true }) });
@@ -762,14 +759,43 @@ test("a throttled action does not leave an error in the next dialog", async ({ p
   await page.getByRole("button", { name: "Изменить телефон и пароль" }).click();
   await expect(dialog.getByRole("alert")).toHaveCount(0);
 });
-test("month overflow labels fit and unassigned and cancelled shifts have clear statuses", async ({ page }) => {
+test("mobile menu keeps logout visible and permits another account after push cleanup fails", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 640 });
+  await page.context().setExtraHTTPHeaders({ "X-Forwarded-For": "127.30.0.4" });
+  await page.context().addCookies([{ name: "rcs_session", value: "mobile-logout-ui-test-session", url: "http://127.0.0.1:3181", httpOnly: true, sameSite: "Strict" }]);
+  await page.goto("/#schedule");
+  await expect(page.locator(".person-cell").first()).toBeVisible();
+  await page.evaluate(() => { localStorage.setItem("rcs-push-device", "stale-device"); localStorage.setItem("rcs-push-user", "old-user"); });
+  await page.route("**/api/me/push-devices", route => route.fulfill({ status: 500, json: { message: "Device cleanup unavailable" } }));
+  await page.getByRole("button", { name: "Открыть меню", exact: true }).click();
+  const logout = page.locator(".sidebar-logout");
+  for (const height of [640, 480]) {
+    await page.setViewportSize({ width: 390, height });
+    for (const scrollTop of [0, 10000]) {
+      await page.locator(".sidebar-scroll").evaluate((node, top) => { node.scrollTop = top; }, scrollTop);
+      await expect(logout).toBeInViewport({ ratio: 1 });
+      expect(await logout.evaluate(node => { const b = node.getBoundingClientRect(); return document.elementFromPoint(b.x + b.width / 2, b.y + b.height / 2)?.closest("button") === node; })).toBe(true);
+    }
+  }
+  await logout.click();
+  await expect(page.getByRole("button", { name: "Войти в RCS" })).toBeVisible();
+  expect((await page.request.get("/api/auth/me")).status()).toBe(401);
+  expect(await page.evaluate(() => sessionStorage.getItem("rcs-user"))).toBeNull();
+  expect(await page.evaluate(() => localStorage.getItem("rcs-push-device"))).toBeNull();
+  await page.getByLabel("Телефон", { exact: true }).fill("+375290000002");
+  await page.getByLabel("Пароль", { exact: true }).fill("BrowserTests!2026");
+  await page.getByRole("button", { name: "Войти в RCS" }).click();
+  await expect(page.locator(".user-block")).toContainText("Максим Ковалёв");
+});
+
+test("month overflow labels fit, unassigned shifts are clear and cancelled shifts stay hidden", async ({ page }) => {
   await page.setViewportSize({ width: 360, height: 640 });
   await regressionSession(page);
   const types = await (await page.request.get("/api/shift-types")).json();
   const me = await (await page.request.get("/api/auth/me")).json();
   const day = new Date(Date.parse(me.server_now) + 3 * 86400000).toISOString().slice(0, 10);
   const created: string[] = [];
-  for (const hour of [8, 10, 12]) {
+  for (const hour of [8, 10, 12, 14]) {
     const r = await page.request.post("/api/shifts", { headers: { "X-CSRF-Token": "regression-csrf" }, data: { date: day, start_time: `${hour.toString().padStart(2, "0")}:00`, end_time: `${(hour + 1).toString().padStart(2, "0")}:00`, type_id: types[0].id, user_id: null, status: hour === 10 ? "cancelled" : "confirmed" } });
     expect(r.ok(), await r.text()).toBe(true);
     created.push((await r.json()).id);
@@ -792,7 +818,11 @@ test("month overflow labels fit and unassigned and cancelled shifts have clear s
   expect(dimensions.textWidth).toBeLessThanOrEqual(dimensions.buttonWidth);
   expect(dimensions.textRight).toBeLessThanOrEqual(dimensions.cellRight);
   expect(dimensions.textBottom).toBeLessThanOrEqual(dimensions.cellBottom);
-  await expect(cell.locator(".shift-chip.cancelled")).toHaveCount(1);
+  await expect(cell.locator(".shift-chip.cancelled")).toHaveCount(0);
+  for (const mode of ["День", "Неделя"]) {
+    await page.getByRole("button", { name: mode, exact: true }).click();
+    await expect(page.locator(".shift-chip.cancelled")).toHaveCount(0);
+  }
   await page.screenshot({ path: ".data/qa/regression-month-more.png", fullPage: true });
 });
 test("admin payroll shows only employee monthly hours and salary", async ({ page }) => {
@@ -884,7 +914,8 @@ test("schedule grid rows stay aligned with multiple and cancelled shifts in ligh
     { id: "grid-vacant", user_id: null, user_name: null, date, start_time: "08:00", end_time: "15:00", type_name: "Без сотрудника", status: "cancelled" },
   ] }));
   await page.goto("/#schedule");
-  await expect(page.locator(".shift-chip.cancelled")).toHaveCount(2);
+  await expect(page.locator(".shift-chip")).toHaveCount(2);
+  await expect(page.locator(".shift-chip.cancelled")).toHaveCount(0);
   for (const width of [1280, 390]) {
     await page.setViewportSize({ width, height: 900 });
     for (const theme of ["light", "dark"]) {

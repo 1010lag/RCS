@@ -479,7 +479,7 @@ export async function createApp(
     "GET",
     "/employees",
     async () =>
-      (await db.query("SELECT * FROM users ORDER BY active DESC,name")).map(
+      (await db.query("SELECT * FROM users WHERE active ORDER BY name")).map(
         publicUser,
       ),
     true,
@@ -768,14 +768,14 @@ export async function createApp(
   route("GET", "/schedule", async (req) => {
     const [from, to] = range(req);
     return db.query(
-      `SELECT ${shiftProjection} ${req.user.role === "admin" ? financeProjection : ""} ${shiftJoins} ${req.user.role === "admin" ? adjustmentJoin : ""} WHERE s.date BETWEEN $1 AND $2 ORDER BY s.start_at,u.name`,
+      `SELECT ${shiftProjection} ${req.user.role === "admin" ? financeProjection : ""} ${shiftJoins} ${req.user.role === "admin" ? adjustmentJoin : ""} WHERE s.date BETWEEN $1 AND $2 AND s.status<>'cancelled' AND (s.user_id IS NULL OR u.active) ORDER BY s.start_at,u.name`,
       [from, to],
     );
   });
   route("GET", "/me/shifts", async (req) => {
     const [from, to] = range(req);
     return db.query(
-      `SELECT ${shiftProjection} ${financeProjection} ${shiftJoins} ${adjustmentJoin} WHERE s.user_id=$1 AND s.date BETWEEN $2 AND $3 ORDER BY s.start_at`,
+      `SELECT ${shiftProjection} ${financeProjection} ${shiftJoins} ${adjustmentJoin} WHERE s.user_id=$1 AND s.date BETWEEN $2 AND $3 AND s.status<>'cancelled' ORDER BY s.start_at`,
       [req.user.id, from, to],
     );
   });

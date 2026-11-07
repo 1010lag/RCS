@@ -1,6 +1,5 @@
 import "dotenv/config";
 import { existsSync } from "node:fs";
-import { createReadStream } from "node:fs";
 import { resolve } from "node:path";
 import fastifyStatic from "@fastify/static";
 import { openDatabase } from "./db";
@@ -9,17 +8,9 @@ import { startWorker, tick } from "./worker";
 const db = await openDatabase();
 let wakeWorker = () => {};
 const app = await createApp(db, { logger: true, onMutation: () => wakeWorker() });
-app.get("/download/rcs.apk", async (_req, reply) => {
-  const apk = resolve(".data/apk/RCS.apk");
-  if (!existsSync(apk) && process.env.APK_DOWNLOAD_URL)
-    return reply.redirect(process.env.APK_DOWNLOAD_URL);
-  if (!existsSync(apk))
-    return reply.code(404).send({ message: "APK ещё не собран" });
-  return reply
-    .header("Content-Type", "application/vnd.android.package-archive")
-    .header("Content-Disposition", 'attachment; filename="RCS.apk"')
-    .send(createReadStream(apk));
-});
+app.get("/download/rcs.apk", async (_req, reply) =>
+  reply.code(410).send({ message: "APK больше не распространяется. Откройте сайт или приложение в Telegram." }),
+);
 if (existsSync("dist/index.html")) {
   await app.register(fastifyStatic, { root: resolve("dist") });
   app.setNotFoundHandler((req, reply) =>

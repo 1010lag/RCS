@@ -233,7 +233,19 @@ svg {
 }
 .sidebar-bottom {
   margin-top: auto;
-  padding-top: 25px;
+  padding-top: 8px;
+  flex-shrink: 0;
+  border-top: 1px solid var(--border);
+  background: var(--surface, white);
+}
+.sidebar-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.sidebar-logout {
+  color: var(--accent, var(--red));
 }
 .time-note {
   font-size: 10px;

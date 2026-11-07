@@ -376,7 +376,8 @@ describe("Archiving employees and shift types", () => {
     expect(result.json().active).toBe(false);
     expect((await call(a, "GET", "/auth/me")).statusCode).toBe(401);
     expect((await call(admin, "GET", "/team")).json().some((u: any) => u.id === ids[1])).toBe(false);
-    expect((await call(admin, "GET", `/schedule?from=${yesterday}&to=${yesterday}`)).json().some((s: any) => s.id === id)).toBe(true);
+    expect((await call(admin, "GET", `/schedule?from=${yesterday}&to=${yesterday}`)).json().some((s: any) => s.id === id)).toBe(false);
+    expect((await call(admin, "GET", "/employees")).json().some((u: any) => u.id === ids[1])).toBe(false);
     expect((await db.query("SELECT * FROM users WHERE id=$1", [ids[1]]))).toHaveLength(1);
     expect((await db.query("SELECT * FROM adjustments WHERE shift_id=$1", [id]))).toHaveLength(1);
     expect((await db.query("SELECT * FROM sessions WHERE user_id=$1", [ids[1]]))).toHaveLength(0);
@@ -416,7 +417,7 @@ describe("Archiving employees and shift types", () => {
     expect((await db.query("SELECT status FROM exchange_listings WHERE id=$1", [listing]))[0].status).toBe("closed");
     for (const client of [admin, b]) {
       const schedule = (await call(client, "GET", `/schedule?from=${day}&to=${day}`)).json();
-      expect(schedule.map((shift: any) => shift.id)).toEqual([current, future, unaffected]);
+      expect(schedule.map((shift: any) => shift.id)).toEqual([unaffected]);
       expect((await call(client, "GET", "/exchange")).json().some((entry: any) => entry.id === listing)).toBe(false);
     }
   });

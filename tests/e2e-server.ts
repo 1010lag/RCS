@@ -75,7 +75,7 @@ await db.tx(async (sql) => {
   await sql.query("INSERT INTO sessions(id,user_id,csrf,expires_at) VALUES($1,$2,'calendar-csrf',clock_timestamp()+interval '1 hour')", [createHash("sha256").update("calendar-ui-test-session").digest("hex"), calendarAdmin]);
   // These scenarios must not inherit the long calendar test's request budget
   // or revoke a session reused by another regression scenario.
-  for (const [index, scenario] of ["logout", "audit", "grid"].entries()) {
+  for (const [index, scenario] of ["logout", "audit", "grid", "mobile-logout"].entries()) {
     const person = uid();
     await sql.query("INSERT INTO users(id,name,phone,role,password_hash) VALUES($1,$2,$3,'admin',$4)", [person, `Изолированный ${scenario}`, `+37529999994${index}`, password]);
     await sql.query("INSERT INTO sessions(id,user_id,csrf,expires_at) VALUES($1,$2,'isolated-csrf',clock_timestamp()+interval '1 hour')", [createHash("sha256").update(`${scenario}-ui-test-session`).digest("hex"), person]);

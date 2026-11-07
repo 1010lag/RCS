@@ -51,14 +51,10 @@ export function Schedule({
     mineIds = new Set(mine.map((s) => s.id));
   const source = (
     onlyMine ? shifts.filter((s) => mineIds.has(s.id)) : shifts
-  );
-  const staffById = new Map<string, { id: string; name: string; avatar_url?: string | null; archived?: boolean }>(team.map((user) => [user.id, user]));
-  for (const shift of source) {
-    if (shift.user_id && !staffById.has(shift.user_id)) staffById.set(shift.user_id, { id: shift.user_id, name: shift.user_name ?? "Сотрудник в архиве", avatar_url: shift.user_avatar_url, archived: true });
-  }
-  const staff = [...staffById.values()].filter(
+  ).filter((s) => s.status !== "cancelled" && (!s.user_id || team.some((u) => u.id === s.user_id)));
+  const staff = team.filter(
     (u) =>
-      (!onlyMine || mine.some((s) => s.user_id === u.id)) &&
+      (!onlyMine || source.some((s) => s.user_id === u.id)) &&
       u.name.toLowerCase().includes(search.toLowerCase()),
   );
   const visibleDays = mode === "day" ? [anchor] : days;
@@ -83,7 +79,7 @@ export function Schedule({
         key={s.id}
         aria-label={`${s.user_name ?? "Не назначена"}, ${s.start_time}–${s.end_time}, ${s.type_name}, ${statusLabels[s.status]}`}
         onClick={() => open(s)}
-        className={`shift-chip ${s.status === "cancelled" ? "cancelled" : s.exchange_id ? "exchange" : s.type_name.toLowerCase().includes("закрыт") ? "closing" : ""}`}
+        className={`shift-chip ${s.exchange_id ? "exchange" : s.type_name.toLowerCase().includes("закрыт") ? "closing" : ""}`}
       >
         <span className="chip-time">
           {s.start_time} – {s.end_time}
@@ -92,8 +88,7 @@ export function Schedule({
           {s.type_name}
           {s.exchange_id && <i />}
         </span>
-        {s.status === "cancelled" && <span className="chip-status">Отменена</span>}
-        {!s.user_id && s.status !== "cancelled" && <span className="chip-status">Не назначена</span>}
+        {!s.user_id && <span className="chip-status">Не назначена</span>}
         {mode === "month" && <span className="chip-owner"><Avatar name={s.user_name ?? "?"} src={team.find((u) => u.id === s.user_id)?.avatar_url} small /><span>{s.user_name ?? "Не назначена"}</span></span>}
       </button>
     );
@@ -241,7 +236,6 @@ export function Schedule({
                     <span>
                       <strong>{u.name}</strong>
                       <small>
-                        {u.archived && "В архиве · "}
                         {
                           source.filter(
                             (s) =>
@@ -262,7 +256,7 @@ export function Schedule({
                       {source
                         .filter((s) => s.user_id === u.id && s.date === day)
                         .map(chip)}
-                      {admin && !u.archived &&
+                      {admin &&
                         !source.some(
                           (s) => s.user_id === u.id && s.date === day,
                         ) && (

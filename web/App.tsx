@@ -178,7 +178,6 @@ export function App() {
     [modal, updateModal] = useState<Modal | null>(null),
     [busy, setBusy] = useState(false),
     [employees, setEmployees] = useState<User[]>([]),
-    [employeeArchive, setEmployeeArchive] = useState(false),
     [typeArchive, setTypeArchive] = useState(false),
     [auditRows, setAuditRows] = useState<Audit[]>([]),
     [history, setHistory] = useState<Listing[]>([]),
@@ -487,7 +486,6 @@ export function App() {
     setAnchor(minskDate());
     setMenu(false);
     setToast("");
-    setEmployeeArchive(false);
     setTypeArchive(false);
     setCsrf("");
     sessionStorage.removeItem("rcs-user");
@@ -500,15 +498,22 @@ export function App() {
     return () => window.removeEventListener("rcs-push-revoked", revoked);
   }, [config]);
   async function logout() {
+    if (busy) return;
+    setBusy(true);
+    setError("");
     try {
       const deviceId = localStorage.getItem("rcs-push-device");
-      if (deviceId) await api("/me/push-devices", "DELETE", { id: deviceId });
-      await api("/auth/logout", "POST");
+      if (deviceId) await api("/me/push-devices", "DELETE", { id: deviceId }).catch(() => {});
+      await api("/auth/logout", "POST").catch((e) => {
+        if (!(e instanceof ApiError) || e.status !== 401) throw e;
+      });
       localStorage.removeItem("rcs-push-device");
       localStorage.removeItem("rcs-push-user");
       await forget();
     } catch (e: any) {
       setError("Для выхода и отзыва сессии восстановите подключение");
+    } finally {
+      setBusy(false);
     }
   }
   async function act(action: () => Promise<any>, message = "Готово") {
@@ -647,6 +652,7 @@ export function App() {
   return (
     <div className="app-shell">
       <aside className={`sidebar ${menu ? "open" : ""}`}>
+        <div className="sidebar-scroll">
         <a href="#home" className="brand-link" onClick={() => navigate("home")}>
           <Brand />
           <span className="brand-sub">COFFEE. PEOPLE. SCHEDULE.</span>
@@ -689,17 +695,22 @@ export function App() {
               </button>
             ))}
         </nav>
-        <div className="sidebar-bottom">
           <div className="time-note">
             <span className="live-dot" />
             Время команды — Минск<small>Europe/Minsk · UTC+3</small>
           </div>
+        </div>
+        <div className="sidebar-bottom">
           <button
             className={`nav-item ${view === "profile" ? "active" : ""}`}
             onClick={() => navigate("profile")}
           >
             <Settings size={19} />
             Настройки
+          </button>
+          <button className="nav-item sidebar-logout" onClick={logout} disabled={busy}>
+            <LogOut size={19} />
+            Выйти
           </button>
           <button className="user-block" onClick={() => navigate("profile")}>
             <Avatar name={user.name} src={user.avatar_url} />
@@ -1211,12 +1222,9 @@ export function App() {
                         {employees.filter((e) => e.active).length}
                       </span>
                     </h2>
-                    <button className={`btn tiny ${employeeArchive ? "selected" : ""}`} aria-pressed={employeeArchive} onClick={() => setEmployeeArchive(!employeeArchive)}>
-                      {employeeArchive ? "Показать команду" : "Архив сотрудников"}
-                    </button>
                   </div>
                   <div className="employee-grid">
-                    {employees.filter((e) => employeeArchive ? !e.active : e.active).map((e) => (
+                    {employees.filter((e) => e.active).map((e) => (
                       <section
                         className={`panel employee-card ${!e.active ? "inactive" : ""}`}
                         key={e.id}
@@ -1269,11 +1277,11 @@ export function App() {
                       </section>
                     ))}
                   </div>
-                  {!employees.some((e) => employeeArchive ? !e.active : e.active) && (
+                  {!employees.some((e) => e.active) && (
                     <Empty
                       icon={Users}
-                      title={employeeArchive ? "Архив сотрудников пуст" : "Добавьте команду"}
-                      text={employeeArchive ? "Удалённые сотрудники появятся здесь. Чтобы вернуть сотрудника, включите его профиль." : "Создайте профили сотрудников и назначьте первые смены."}
+                      title="Добавьте команду"
+                      text="Создайте профили сотрудников и назначьте первые смены."
                     />
                   )}
                 </>
@@ -1567,7 +1575,7 @@ export function App() {
                         Сервер: {new URL(serverBase()).hostname}
                       </button>
                     )}
-                    <button className="btn full" onClick={logout}>
+                    <button className="btn full" onClick={logout} disabled={busy}>
                       <LogOut size={17} />
                       Выйти из аккаунта
                     </button>
