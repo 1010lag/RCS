@@ -46,7 +46,7 @@ describe("Shared alternative recipes", () => {
     await db.query("UPDATE users SET active=false WHERE id=$1", [users[1]]);
     expect((await call(1, "POST", "/recipes", recipe)).statusCode).toBe(401);
     await db.query("UPDATE users SET must_change_password=true WHERE id=$1", [users[2]]);
-    expect((await call(2, "GET", "/recipes")).statusCode).toBe(403);
+    expect((await call(2, "GET", "/recipes")).statusCode).toBe(200);
   });
   it("validates method, title, instructions and parameter lengths; derives the author from the session", async () => {
     for (const invalid of [{ method: "unknown" }, { title: "   " }, { instructions: "\n " }, { instructions: "x".repeat(8001) }, { coffee: "x".repeat(81) }])

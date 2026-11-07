@@ -759,6 +759,56 @@ test("a throttled action does not leave an error in the next dialog", async ({ p
   await page.getByRole("button", { name: "Изменить телефон и пароль" }).click();
   await expect(dialog.getByRole("alert")).toHaveCount(0);
 });
+test("four-character issued passwords open the app immediately and can be changed from the profile", async ({ page, browser }) => {
+  await page.context().setExtraHTTPHeaders({ "X-Forwarded-For": "127.31.0.5" });
+  await page.context().addCookies([{ name: "rcs_session", value: "password-ui-test-session", url: "http://127.0.0.1:3181", httpOnly: true, sameSite: "Strict" }]);
+  await page.goto("/#employees");
+  await page.getByRole("button", { name: "Добавить сотрудника", exact: true }).click();
+  const dialog = page.getByRole("dialog");
+  await dialog.getByLabel("Имя и фамилия", { exact: true }).fill("Новый вход");
+  await dialog.getByLabel("Телефон", { exact: true }).fill("+375299999908");
+  const issued = dialog.getByLabel("Пароль", { exact: true });
+  await expect(issued).toHaveAttribute("minlength", "4");
+  await expect(dialog.getByLabel("Временный пароль", { exact: true })).toHaveCount(0);
+  await issued.fill("1234");
+  await dialog.getByRole("button", { name: "Сохранить", exact: true }).click();
+  await expect(page.getByRole("status")).toContainText("Сотрудник добавлен");
+  const context = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, extraHTTPHeaders: { "X-Forwarded-For": "127.31.0.6" } });
+  try {
+    const employee = await context.newPage();
+    await employee.goto("/");
+    await employee.getByLabel("Телефон", { exact: true }).fill("+375299999908");
+    await employee.getByLabel("Пароль", { exact: true }).fill("0000");
+    await employee.getByRole("button", { name: "Войти в RCS" }).click();
+    await expect(employee.getByRole("alert")).toContainText("Неверный телефон или пароль");
+    await employee.getByLabel("Пароль", { exact: true }).fill("1234");
+    await employee.getByRole("button", { name: "Войти в RCS" }).click();
+    await expect(employee.getByRole("heading", { name: /Добр/ })).toBeVisible();
+    await expect(employee.getByRole("heading", { name: "Задайте свой пароль" })).toHaveCount(0);
+    // An older cached account payload must not restore the retired blocking screen.
+    await employee.route("**/api/auth/me", async route => {
+      const response = await route.fetch();
+      const body = await response.json();
+      await route.fulfill({ response, json: { ...body, user: { ...body.user, must_change_password: true } } });
+    });
+    await employee.reload();
+    await expect(employee.getByRole("heading", { name: /Добр/ })).toBeVisible();
+    await employee.goto("/#profile");
+    await employee.locator(".password-details summary").click();
+    await employee.getByLabel("Текущий пароль", { exact: true }).fill("1234");
+    await expect(employee.getByLabel("Новый пароль", { exact: true })).toHaveAttribute("minlength", "4");
+    await employee.getByLabel("Новый пароль", { exact: true }).fill("5678");
+    await employee.locator(".password-details").getByRole("button", { name: "Сменить пароль", exact: true }).click();
+    await expect(employee.getByRole("status")).toContainText("Пароль изменён");
+    await employee.getByRole("button", { name: "Выйти из аккаунта", exact: true }).click();
+    await expect(employee.getByRole("button", { name: "Войти в RCS" })).toBeVisible();
+    await employee.getByLabel("Телефон", { exact: true }).fill("+375299999908");
+    await employee.getByLabel("Пароль", { exact: true }).fill("5678");
+    await employee.getByRole("button", { name: "Войти в RCS" }).click();
+    await expect(employee.getByRole("heading", { name: /Добр/ })).toBeVisible();
+  } finally { await context.close(); }
+});
+
 test("mobile menu keeps logout visible and permits another account after push cleanup fails", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 640 });
   await page.context().setExtraHTTPHeaders({ "X-Forwarded-For": "127.30.0.4" });

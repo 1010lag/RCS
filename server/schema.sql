@@ -9,6 +9,9 @@ CREATE TABLE IF NOT EXISTS users (
 -- statement
 CREATE TABLE IF NOT EXISTS sessions (id text PRIMARY KEY, user_id uuid NOT NULL REFERENCES users(id), csrf text NOT NULL, expires_at timestamptz NOT NULL);
 -- statement
+-- Retire the mandatory first-login password change without changing credentials.
+UPDATE users SET must_change_password=false,version=version+1 WHERE must_change_password;
+-- statement
 ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url text;
 -- statement
 CREATE TABLE IF NOT EXISTS shift_types (

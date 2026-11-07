@@ -119,6 +119,16 @@ describe("Telegram integration", () => {
     expect((await app.inject({ method: "GET", url: "/api/auth/me", headers: { cookie } })).statusCode).toBe(401);
     expect((await request("GET", "/auth/me")).statusCode).toBe(200);
   });
+  it("ignores retired password flags for Telegram linking, login and delivery", async () => {
+    await db.query("UPDATE users SET must_change_password=true WHERE id=$1", [user]);
+    await connect();
+    const response = await request("POST", "/auth/telegram", { init_data: signed() });
+    expect(response.statusCode, response.body).toBe(200);
+    expect(response.json().user.must_change_password).toBe(false);
+    await db.tx(sql => notify(sql, [user], "Проверка входа", "Смена доступна", "schedule"));
+    await deliverTelegram(db, bot);
+    expect(sent).toHaveLength(1);
+  });
   it("delivers through the worker with Firebase disabled, deduplicates events and respects preferences", async () => {
     await connect();
     await db.tx(sql => notify(sql, [user], "Новая смена", "2026-11-04 · 08:00", "schedule", "schedule", "same"));

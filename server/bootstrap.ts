@@ -20,10 +20,10 @@ try {
   const number = phone(await rl.question("Телефон (+375…): "));
   const password =
     process.env.ADMIN_PASSWORD ??
-    (await rl.question("Новый пароль (от 10 символов, ввод видимый): "));
+    (await rl.question("Новый пароль (от 4 символов, ввод видимый): "));
   rl.close();
-  if (!name || password.trim().length < 10 || password.length > 128)
-    throw new Error("Имя обязательно, пароль — от 10 символов");
+  if (!name || password.trim().length < 4 || password.length > 128)
+    throw new Error("Имя обязательно, пароль — от 4 символов");
   const hashed = await hash(password),
     id = uid();
   await db.tx(async (sql) => {

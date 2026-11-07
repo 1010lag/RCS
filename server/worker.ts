@@ -171,7 +171,7 @@ export async function nextWorkerDelay(db: Database, maxIdleMs: number, push: Pus
       UNION ALL
       SELECT d.next_attempt FROM telegram_deliveries d JOIN telegram_accounts a ON a.id=d.account_id
       JOIN notifications n ON n.id=d.notification_id AND n.user_id=a.user_id
-      JOIN users u ON u.id=a.user_id AND u.active AND NOT u.must_change_password
+      JOIN users u ON u.id=a.user_id AND u.active
       LEFT JOIN preferences p ON p.user_id=u.id
       WHERE $4::boolean AND d.sent_at IS NULL AND d.attempts<8 AND COALESCE((to_jsonb(p)->>n.category)::boolean,true)
     )

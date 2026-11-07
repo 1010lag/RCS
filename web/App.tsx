@@ -300,7 +300,7 @@ export function App() {
     }
   }
   async function load() {
-    if (!user || user.must_change_password) return;
+    if (!user) return;
     const id = user.id,
       seq = ++requestSeq.current;
     setLoading(true);
@@ -361,9 +361,9 @@ export function App() {
   }
   useEffect(() => {
     void load();
-  }, [user?.id, user?.must_change_password, anchor]);
+  }, [user?.id, anchor]);
   useEffect(() => {
-    if (!user || user.must_change_password) return;
+    if (!user) return;
     let disposed = false;
     let source: EventSource | null = null,
       timer: ReturnType<typeof setInterval> | undefined;
@@ -415,9 +415,9 @@ export function App() {
       window.removeEventListener("offline", offlineEvent);
       window.removeEventListener("rcs-push-revoked", connect);
     };
-  }, [user?.id, user?.must_change_password, anchor]);
+  }, [user?.id, anchor]);
   useEffect(() => {
-    if (!user || user.must_change_password) return;
+    if (!user) return;
     if (view === "employees" && isAdmin)
       api<User[]>("/employees")
         .then(setEmployees)
@@ -443,7 +443,6 @@ export function App() {
   useEffect(() => {
     if (
       user &&
-      !user.must_change_password &&
       !nativeApp &&
       config?.push_ready &&
       !offline &&
@@ -454,9 +453,9 @@ export function App() {
       // Refresh an already approved subscription; never prompt on page load.
       void registerPushDevice(config, user.id).catch(() => {});
     }
-  }, [user?.id, user?.must_change_password, config?.push_ready, offline]);
+  }, [user?.id, config?.push_ready, offline]);
   useEffect(() => {
-    if (!nativeApp || !user || user.must_change_password || offline || !config?.push_android_ready || import.meta.env.VITE_NATIVE_FIREBASE_CONFIGURED !== "true") return;
+    if (!nativeApp || !user || offline || !config?.push_android_ready || import.meta.env.VITE_NATIVE_FIREBASE_CONFIGURED !== "true") return;
     if (import.meta.env.VITE_NATIVE_FIREBASE_PROJECT_ID && import.meta.env.VITE_NATIVE_FIREBASE_PROJECT_ID !== config?.push_project_id) return;
     const refresh = () => {
       if (localStorage.getItem("rcs-push-user") !== user.id) return;
@@ -466,7 +465,7 @@ export function App() {
     const visible = () => { if (document.visibilityState === "visible") refresh(); };
     document.addEventListener("visibilitychange", visible);
     return () => document.removeEventListener("visibilitychange", visible);
-  }, [user?.id, user?.must_change_password, config?.push_android_ready, config?.push_project_id, offline]);
+  }, [user?.id, config?.push_android_ready, config?.push_project_id, offline]);
   async function forget() {
     void clearPushRegistration(config);
     activeUser.current = null;
@@ -599,54 +598,6 @@ export function App() {
           sessionStorage.setItem("rcs-user", JSON.stringify(result.user));
         }}
       />
-    );
-  if (user.must_change_password)
-    return (
-      <div className="password-page">
-        <Brand />
-        <div className="panel">
-          <h1>Задайте свой пароль</h1>
-          <p>Для первого входа замените временный пароль.</p>
-          <Form
-            onSubmit={(b) =>
-              act(async () => {
-                await api("/auth/password", "POST", {
-                  current: b.current,
-                  password: b.password,
-                });
-                const r = await api("/auth/me");
-                setUser(r.user);
-              }, "Пароль обновлён")
-            }
-          >
-            <Field label="Временный пароль">
-              <input
-                type="password"
-                name="current"
-                required
-                autoComplete="current-password"
-              />
-            </Field>
-            <Field label="Новый пароль">
-              <input
-                type="password"
-                name="password"
-                minLength={10}
-                required
-                autoComplete="new-password"
-              />
-            </Field>
-            <button className="btn primary" disabled={busy}>
-              Сохранить пароль
-            </button>
-          </Form>
-          {error && (
-            <p role="alert" className="error">
-              {error}
-            </p>
-          )}
-        </div>
-      </div>
     );
   const restricted = ["employees", "types", "audit"].includes(view) && !isAdmin;
   return (
@@ -1643,7 +1594,7 @@ export function App() {
                           <input
                             type="password"
                             name="password"
-                            minLength={10}
+                            minLength={4}
                             autoComplete="new-password"
                             required
                           />
@@ -2325,7 +2276,7 @@ function ModalDialog({
       current_password: b.current_password,
     }), "Данные для входа обновлены")}>
       <Field label="Номер телефона"><input name="phone" type="tel" autoComplete="tel" defaultValue={user.phone} required /></Field>
-      <Field label="Новый пароль" hint="Не менее 10 символов. Оставьте пустым, чтобы сохранить текущий пароль."><input name="password" type="password" autoComplete="new-password" minLength={10} maxLength={128} /></Field>
+      <Field label="Новый пароль" hint="Не менее 4 символов. Оставьте пустым, чтобы сохранить текущий пароль."><input name="password" type="password" autoComplete="new-password" minLength={4} maxLength={128} /></Field>
       <Field label="Текущий пароль"><input name="current_password" type="password" autoComplete="current-password" maxLength={128} required /></Field>
       <p className="muted small">После смены пароля остальные сеансы будут завершены. Следующий вход — с новым телефоном и паролем.</p>
       <div className="modal-footer"><button className="btn" type="button" onClick={close}>Отмена</button><button className="btn primary" disabled={busy || offline}>Сохранить</button></div>
@@ -2487,20 +2438,20 @@ function ModalDialog({
               </select>
             </Field>
             <Field
-              label="Временный пароль"
-              hint="От 10 символов. Сотрудник сменит его при первом входе."
+              label="Пароль"
+              hint="От 4 символов. Сотрудник входит с этим паролем сразу."
             >
               <input
                 name="password"
                 type="password"
-                minLength={10}
+                minLength={4}
                 autoComplete="new-password"
                 required
               />
             </Field>
           </>
         )}
-        {e && (e.role !== "admin" || e.id === user.id) && <Field label="Новый пароль" hint={e.id === user.id ? "Оставьте пустым, чтобы не менять пароль." : "Оставьте пустым, чтобы не менять пароль. После сброса сотрудник задаст свой пароль при входе."}><input name="password" type="password" minLength={10} maxLength={128} autoComplete="new-password" /></Field>}
+        {e && (e.role !== "admin" || e.id === user.id) && <Field label="Новый пароль" hint="Оставьте пустым, чтобы не менять пароль. Новый пароль действует сразу."><input name="password" type="password" minLength={4} maxLength={128} autoComplete="new-password" /></Field>}
         {((!e && employeeRole === "admin") || (e && (e.role !== "admin" || e.id === user.id))) && <Field label="Текущий пароль администратора" hint="Обязателен при смене телефона, пароля или создании нового администратора."><input name="current_password" type="password" autoComplete="current-password" maxLength={128} required={!e && employeeRole === "admin"} /></Field>}
         {e?.role === "admin" && e.id !== user.id && <p className="muted small">Телефон и пароль другого администратора изменяет только владелец аккаунта в своём профиле.</p>}
         <div className="form-row">

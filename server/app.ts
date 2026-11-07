@@ -52,8 +52,8 @@ const digest = (s: string) => createHash("sha256").update(s).digest("hex");
 const idSchema = z.string().uuid();
 z.config(z.locales.ru());
 const text = z.string().trim().min(1, "Заполните поле").max(200);
-const passwordSchema = z.string().min(10, "Пароль должен содержать минимум 10 символов").max(128)
-  .refine((value) => value.trim().length >= 10, "Пароль должен содержать минимум 10 символов без пробелов по краям");
+const passwordSchema = z.string().min(4, "Пароль должен содержать минимум 4 символа").max(128)
+  .refine((value) => value.trim().length >= 4, "Пароль должен содержать минимум 4 символа без пробелов по краям");
 const reasonSchema = z.object({
   reason: z.string().trim().min(3, "Укажите причину (от 3 символов)").max(1000),
 });
@@ -233,13 +233,6 @@ export async function createApp(
       if (req.headers["x-csrf-token"] !== s.csrf)
         fail("CSRF", "Обновите страницу и повторите действие", 403);
     }
-    if (
-      s.must_change_password &&
-      !["/api/auth/me", "/api/auth/password", "/api/auth/logout"].includes(
-        req.url.split("?")[0],
-      )
-    )
-      fail("PASSWORD_CHANGE_REQUIRED", "Сначала смените временный пароль", 403);
   }
   type Handler = (req: FastifyRequest, reply: FastifyReply) => any;
   function route(method: any, url: string, handler: Handler, admin = false, bodyLimit?: number) {
@@ -323,7 +316,7 @@ export async function createApp(
     await consumeBudget(db, budgetKey("telegram-login-user", chat), 10, 60000);
     const token = randomBytes(32).toString("hex"), csrf = randomBytes(24).toString("hex");
     const user = await db.tx(async sql => {
-      const account = (await sql.query("SELECT u.*,a.id AS account_id FROM telegram_accounts a JOIN users u ON u.id=a.user_id WHERE a.chat_id=$1 AND u.active AND NOT u.must_change_password FOR SHARE OF a,u", [chat]))[0];
+      const account = (await sql.query("SELECT u.*,a.id AS account_id FROM telegram_accounts a JOIN users u ON u.id=a.user_id WHERE a.chat_id=$1 AND u.active FOR SHARE OF a,u", [chat]))[0];
       if (!account) fail("TELEGRAM_NOT_LINKED", "Войдите по телефону и подключите Telegram в профиле", 401);
       await sql.query("INSERT INTO sessions(id,user_id,csrf,expires_at,telegram_account_id) VALUES($1,$2,$3,clock_timestamp()+interval '7 days',$4)", [digest(token), account.id, csrf, account.account_id]);
       return publicUser(account);
@@ -501,7 +494,7 @@ export async function createApp(
         const hashed = await cpu.run(() => hash(b.password));
         const u = (
           await sql.query(
-            "INSERT INTO users(id,name,phone,role,rate,pay_type,password_hash,must_change_password) VALUES($1,$2,$3,$4,$5,$6,$7,true) RETURNING *",
+            "INSERT INTO users(id,name,phone,role,rate,pay_type,password_hash) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *",
             [
               id,
               clean.name,
@@ -576,7 +569,7 @@ export async function createApp(
         const newPasswordHash = b.password ? await cpu.run(() => hash(b.password!)) : null;
         if (newPasswordHash) {
           if (!b.active) fail("INACTIVE_USER", "Для смены пароля сначала восстановите сотрудника");
-          await sql.query("UPDATE users SET password_hash=$1,must_change_password=$2 WHERE id=$3", [newPasswordHash, id !== req.user.id, id]);
+          await sql.query("UPDATE users SET password_hash=$1,must_change_password=false WHERE id=$2", [newPasswordHash, id]);
           await audit(sql, req.user.id, "Пароль сотрудника изменён", "user", id, null, { other_sessions_revoked: true }, b.reason);
         }
         if (!b.active) {

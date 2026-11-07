@@ -86,7 +86,8 @@ export const publicUser = (u: any): User => ({
   rate: u.rate,
   pay_type: u.pay_type,
   version: u.version,
-  must_change_password: u.must_change_password,
+  // Kept for older clients; administrator-issued passwords work immediately.
+  must_change_password: false,
   avatar_url: u.avatar_url ?? null,
 });
 export async function now(sql: Sql): Promise<Date> {

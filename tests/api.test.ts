@@ -480,10 +480,34 @@ describe("Account credentials and shared avatars", () => {
     expect((await call(a, "GET", "/auth/me")).statusCode).toBe(401);
     const session = await signIn("+375299999902", "ResetEmployee!2026");
     expect(session.statusCode, session.body).toBe(200);
-    expect(session.json().user.must_change_password).toBe(true);
+    expect(session.json().user.must_change_password).toBe(false);
+    const resetClient = { cookie: session.headers["set-cookie"]!.toString().split(";")[0], csrf: session.json().csrf };
+    expect((await call(resetClient, "GET", "/schedule")).statusCode).toBe(200);
     const logs = JSON.stringify(await db.query("SELECT before_value,after_value FROM audit_logs"));
     expect(logs).not.toContain("ResetEmployee!2026");
     expect(logs).not.toContain("password_hash");
+  });
+  it("accepts four-character passwords for creation, reset and voluntary changes without a first-login gate", async () => {
+    const created = await call(admin, "POST", "/employees", { name: "Первый вход", phone: "+375299999905", password: "1234", rate: "9.00" });
+    expect(created.statusCode, created.body).toBe(200);
+    expect(created.json().must_change_password).toBe(false);
+    const session = await signIn("+375299999905", "1234");
+    expect(session.statusCode, session.body).toBe(200);
+    const employee = { cookie: session.headers["set-cookie"]!.toString().split(";")[0], csrf: session.json().csrf };
+    expect((await call(employee, "GET", "/schedule")).statusCode).toBe(200);
+    // Legacy flags cannot block access, including sessions created by older builds.
+    await db.query("UPDATE users SET must_change_password=true WHERE id=$1", [created.json().id]);
+    expect((await call(employee, "GET", "/auth/me")).json().user.must_change_password).toBe(false);
+    expect((await call(employee, "GET", "/team")).statusCode).toBe(200);
+    expect((await call(employee, "POST", "/auth/password", { current: "1234", password: "5678" })).statusCode).toBe(200);
+    expect((await signIn("+375299999905", "1234")).statusCode).toBe(401);
+    expect((await signIn("+375299999905", "5678")).statusCode).toBe(200);
+    expect((await edit(1, admin, { password: "4321", current_password: "TestPassword!2026" })).statusCode).toBe(200);
+    const reset = await signIn("+375290000001", "4321");
+    expect(reset.statusCode, reset.body).toBe(200);
+    expect(reset.json().user.must_change_password).toBe(false);
+    expect((await call(admin, "POST", "/employees", { name: "Короткий", phone: "+375299999906", password: "123" })).statusCode).toBe(422);
+    expect((await call(admin, "POST", "/employees", { name: "Пробелы", phone: "+375299999907", password: "    " })).statusCode).toBe(422);
   });
   it("stores an avatar on the server and exposes it in the team and all calendar views", async () => {
     const id = await shift();

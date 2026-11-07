@@ -98,7 +98,7 @@ export async function handleTelegramUpdate(db: Database, update: any, bot: Teleg
     const match = /^\/start(?:@\w+)?(?:\s+link_([\w-]{32}))?\s*$/.exec(text);
     if (!match) return null;
     if (!match[1]) return { title: "RCS — команда в ритме", body: "Откройте приложение. Для уведомлений войдите в свой профиль → Telegram → Подключить Telegram." };
-    const link = (await sql.query("SELECT l.user_id FROM telegram_links l JOIN users u ON u.id=l.user_id WHERE l.token_hash=$1 AND l.expires_at>clock_timestamp() AND u.active AND NOT u.must_change_password FOR UPDATE OF l", [telegramDigest(match[1])]))[0];
+    const link = (await sql.query("SELECT l.user_id FROM telegram_links l JOIN users u ON u.id=l.user_id WHERE l.token_hash=$1 AND l.expires_at>clock_timestamp() AND u.active FOR UPDATE OF l", [telegramDigest(match[1])]))[0];
     if (!link) return { title: "Ссылка недействительна", body: "Создайте новую ссылку в профиле RCS. Ссылка действует 10 минут и используется один раз." };
     const existing = (await sql.query("SELECT user_id FROM telegram_accounts WHERE chat_id=$1", [chat]))[0];
     if (existing && existing.user_id !== link.user_id) return { title: "Этот Telegram уже подключён", body: "Сначала отключите Telegram в прежнем профиле RCS или отправьте /stop." };
@@ -116,13 +116,13 @@ export async function deliverTelegram(db: Database, bot: TelegramGateway = teleg
   const deliveries = await db.query(`SELECT d.id,d.attempts,a.chat_id,n.title,n.body,n.link,n.dedup_key,n.user_id
     FROM telegram_deliveries d JOIN telegram_accounts a ON a.id=d.account_id
     JOIN notifications n ON n.id=d.notification_id AND n.user_id=a.user_id
-    JOIN users u ON u.id=a.user_id AND u.active AND NOT u.must_change_password
+    JOIN users u ON u.id=a.user_id AND u.active
     LEFT JOIN preferences p ON p.user_id=u.id
     WHERE d.sent_at IS NULL AND d.attempts<8 AND d.next_attempt<=clock_timestamp()
       AND COALESCE((to_jsonb(p)->>n.category)::boolean,true)
     ORDER BY d.next_attempt LIMIT 20`);
   for (const d of deliveries) {
-    const current = await db.query("SELECT 1 FROM telegram_deliveries d JOIN telegram_accounts a ON a.id=d.account_id JOIN users u ON u.id=a.user_id WHERE d.id=$1 AND a.chat_id=$2 AND u.active AND NOT u.must_change_password", [d.id, d.chat_id]);
+    const current = await db.query("SELECT 1 FROM telegram_deliveries d JOIN telegram_accounts a ON a.id=d.account_id JOIN users u ON u.id=a.user_id WHERE d.id=$1 AND a.chat_id=$2 AND u.active", [d.id, d.chat_id]);
     if (!current.length) continue;
     if (d.dedup_key?.startsWith("reminder:")) {
       const [, id, version, interval] = d.dedup_key.split(":");
