@@ -20,6 +20,8 @@ if (existsSync("dist/index.html")) {
   );
 }
 await tick(db);
+// Refresh open clients after a deployment changes how existing data is calculated.
+await db.query("INSERT INTO events DEFAULT VALUES");
 const stop = startWorker(db, (e) => app.log.error(e));
 wakeWorker = stop.wake;
 await app.listen({

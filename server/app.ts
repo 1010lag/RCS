@@ -614,8 +614,8 @@ export async function createApp(
             ],
           )
         )[0];
+        if (u.rate !== null) await updateEmployeeRates(sql, req.user.id, id, u.rate, u.pay_type, b.reason);
         if (String(old.rate) !== String(u.rate) || old.pay_type !== u.pay_type) {
-          if (u.rate !== null) await updateEmployeeRates(sql, req.user.id, id, u.rate, u.pay_type, b.reason);
           await notify(sql, [id].filter((recipient) => recipient !== req.user.id), "Ваша ставка изменена",
             u.rate !== null ? "Все смены и начисления, включая уже отработанные часы, пересчитаны по новой ставке сотрудника." : "Индивидуальная ставка убрана. Для новых смен применяются настройки типа смены.", "adjustments", "payroll");
         }
@@ -861,16 +861,17 @@ export async function createApp(
       fail("FUTURE_WORKED", "Будущую смену нельзя отметить отработанной");
     const preserve =
       old &&
+      u?.rate == null &&
       old.user_id === b.user_id &&
       old.type_id === b.type_id &&
       b.rate_override == null;
     const rate =
-      b.rate_override != null
+      u?.rate != null ? positiveRate(u.rate) : b.rate_override != null
         ? (type.pay_type === "hourly" ? positiveRate(b.rate_override) : money(b.rate_override))
         : preserve
           ? old.rate
           : rateFor(type, u);
-    const payType = preserve ? old.pay_type : b.rate_override != null ? type.pay_type : payTypeFor(type, u);
+    const payType = u?.rate != null ? u.pay_type : preserve ? old.pay_type : b.rate_override != null ? type.pay_type : payTypeFor(type, u);
     const args = [
       b.date,
       start,
@@ -880,7 +881,7 @@ export async function createApp(
       b.status,
       payType,
       rate,
-      preserve ? old.rate_override : b.rate_override != null,
+      u?.rate != null ? false : preserve ? old.rate_override : b.rate_override != null,
       b.comment,
       b.exchange_locked,
       id,
@@ -1104,7 +1105,7 @@ export async function createApp(
     )[0];
     if (!u) fail("INACTIVE_USER", "Сотрудник неактивен", 403);
     const rate = rateFor(type, u, s.rate_override ? s.rate : null);
-    const pay_type = s.rate_override ? s.pay_type : payTypeFor(type, u);
+    const pay_type = u.rate != null ? u.pay_type : s.rate_override ? s.pay_type : payTypeFor(type, u);
     const minutes = Math.round(
       (new Date(s.end_at).getTime() - new Date(s.start_at).getTime()) / 60000,
     );
@@ -1315,10 +1316,11 @@ export async function createApp(
           b.minutes;
         if (minutes < 0)
           fail("NEGATIVE_HOURS", "Итоговые часы не могут быть отрицательными");
+        const employee = (await sql.query("SELECT rate,pay_type FROM users WHERE id=$1", [s.user_id]))[0];
         const check = (
           await sql.query(
             "SELECT CASE WHEN $1='shift' THEN $2::numeric ELSE round($3::numeric*$2::numeric/60,2) END+$4::numeric+$5::numeric AS amount,(CASE WHEN $1='shift' THEN $2::numeric ELSE round($3::numeric*$2::numeric/60,2) END+$5::numeric)-(CASE WHEN $1='shift' THEN $2::numeric ELSE round($6::numeric*$2::numeric/60,2) END) AS credit_amount",
-            [s.pay_type, s.rate, minutes, old.amount, b.amount, minutes - b.minutes],
+            [payTypeFor(s, employee), employee?.rate ?? s.rate, minutes, old.amount, b.amount, minutes - b.minutes],
           )
         )[0];
         if (Number(check.amount) < 0)

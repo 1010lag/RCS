@@ -635,6 +635,7 @@ describe("Personal adjustments and exchange notifications", () => {
   });
   it("requires explicit reconciliation when the old hourly rate is unknown", async () => {
     const id = await shift(ids[2]), correction = uid();
+    await db.query("UPDATE users SET rate=NULL WHERE id=$1", [ids[1]]);
     await db.query("INSERT INTO adjustments(id,shift_id,user_id,minutes,reason,created_by) VALUES($1,$2,$3,30,'Старые часы',$4)", [correction, id, ids[1], ids[0]]);
     expect((await call(a, "GET", `/me/payroll?from=${day}&to=${day}`)).json().code).toBe("ADJUSTMENT_REVIEW_REQUIRED");
     expect((await call(a, "PATCH", `/adjustments/${correction}/credit`, { amount: "7.00", reason: "Проверенная ставка 14 Br" })).statusCode).toBe(403);
@@ -1049,6 +1050,31 @@ describe("Atomic exchange", () => {
   });
 });
 describe("Individual hourly rates", () => {
+  it("immediately pays 400 for 40 worked hours at the current rate of 10 despite old shifts saved at 9", async () => {
+    const dates: string[] = [], shifts: string[] = [];
+    await db.query("UPDATE users SET rate=9 WHERE id=$1", [ids[1]]);
+    for (let n = 5; n >= 1; n--) {
+      const date = new Date(Date.parse(day) - n * 86400000).toISOString().slice(0, 10);
+      dates.push(date);
+      shifts.push(await shift(ids[1], { date, start_time: "08:00", end_time: "16:00", status: "closed" }));
+    }
+    // This is existing production data: the profile already changed before
+    // deployment, so no rate-edit request will trigger a snapshot rewrite.
+    await db.query("UPDATE users SET rate=10 WHERE id=$1", [ids[1]]);
+    for (const path of ["/me/payroll", `/payroll?user_id=${ids[1]}`]) {
+      const response = await call(path.startsWith("/me/") ? a : admin, "GET", `${path}${path.includes("?") ? "&" : "?"}from=${dates[0]}&to=${dates[4]}`);
+      expect(response.statusCode, response.body).toBe(200);
+      const rows = response.json();
+      expect(rows.reduce((sum: number, row: any) => sum + row.minutes, 0)).toBe(2400);
+      expect(rows.reduce((sum: number, row: any) => sum + Number(row.amount), 0)).toBe(400);
+    }
+    for (const id of shifts)
+      expect((await call(a, "GET", `/shifts/${id}`)).json()).toMatchObject({ rate: "10.00", amount: "80.00" });
+    expect((await call(a, "GET", `/me/shifts?from=${dates[0]}&to=${dates[4]}`)).json().map((s: any) => s.amount)).toEqual(Array(5).fill("80.00"));
+    await db.query("UPDATE users SET rate=8 WHERE id=$1", [ids[1]]);
+    const reduced = (await call(a, "GET", `/me/payroll?from=${dates[0]}&to=${dates[4]}`)).json();
+    expect(reduced.reduce((sum: number, row: any) => sum + Number(row.amount), 0)).toBe(320);
+  });
   it("creates hourly types without a type rate and calculates pay only from the employee rate", async () => {
     const result = await call(admin, "POST", "/shift-types", { name: "Без ставки типа", start_time: "20:00", end_time: "22:00" });
     expect(result.statusCode, result.body).toBe(200);
@@ -1102,7 +1128,7 @@ describe("Individual hourly rates", () => {
       [future, "22.50"],
       [manual, "22.50"],
       [fixed, "22.50"],
-      [cancelled, "14.00"],
+      [cancelled, "22.50"],
     ])
       expect((await call(a, "GET", `/shifts/${id}`)).json().rate).toBe(rate);
     expect((await call(b, "GET", `/shifts/${foreign}`)).json().rate).toBe("16.00");
