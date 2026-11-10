@@ -219,7 +219,7 @@ export async function closeListing(sql: Sql, shiftId: string) {
   }
 }
 export function payTypeFor(type: any, user: any): PayType {
-  return type.pay_type === "hourly" && user?.rate != null ? user.pay_type : type.pay_type;
+  return user?.rate != null ? user.pay_type : type.pay_type;
 }
 export function positiveRate(value: string) {
   const rate = money(value);
@@ -228,13 +228,12 @@ export function positiveRate(value: string) {
 }
 export function rateFor(type: any, user: any, override?: string | null) {
   if (override != null) return money(override);
+  if (user?.rate != null) return positiveRate(user.rate);
   if (type.pay_type === "hourly") {
     if (!user) return "0.00";
-    if (user.rate == null)
-      return fail("EMPLOYEE_RATE_REQUIRED", "Для расчёта оплаты не задана ставка сотрудника. Обратитесь к администратору");
-    return positiveRate(user.rate);
+    return fail("EMPLOYEE_RATE_REQUIRED", "Для расчёта оплаты не задана ставка сотрудника. Обратитесь к администратору");
   }
-  return user?.rate != null && user.pay_type === "shift" ? user.rate : type.rate;
+  return type.rate;
 }
 export const shiftProjection = `s.id, s.date::text, to_char(s.start_at AT TIME ZONE 'Europe/Minsk','HH24:MI') AS start_time, to_char(s.end_at AT TIME ZONE 'Europe/Minsk','HH24:MI') AS end_time, s.start_at, s.end_at, s.type_id, t.name AS type_name, s.user_id, u.name AS user_name, s.status, s.version, s.exchanged, s.exchange_locked, (t.allow_exchange AND t.active AND NOT EXISTS (SELECT 1 FROM adjustments ax WHERE ax.shift_id=s.id AND (ax.minutes<>0 OR ax.amount<>0))) AS exchange_allowed, l.id AS exchange_id, (CASE WHEN (s.start_at AT TIME ZONE 'Europe/Minsk')::time <= time '10:00' THEN s.date-1+time '19:00' ELSE LEAST(s.start_at AT TIME ZONE 'Europe/Minsk',s.date+time '19:00') END) AT TIME ZONE 'Europe/Minsk' AS closes_at`;
 export const shiftJoins = `FROM shifts s JOIN shift_types t ON t.id=s.type_id LEFT JOIN users u ON u.id=s.user_id LEFT JOIN exchange_listings l ON l.shift_id=s.id AND l.status='open' AND l.closes_at>clock_timestamp()`;

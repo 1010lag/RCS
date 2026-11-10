@@ -230,9 +230,9 @@ describe("Reported logic regressions", () => {
     const loggedIn = await app.inject({ method: "POST", url: "/api/auth/login", remoteAddress: "192.0.2.199", payload: { phone: "80 (29) 000-00-01", password: "TestPassword!2026" } });
     expect(loggedIn.statusCode, loggedIn.body).toBe(200);
   });
-  it("applies profile rate changes to future shifts when selected and rejects zero rates through both editors", async () => {
-    const id = await shift();
-    const body = { name: "Анна", phone: "+375290000001", rate: "21.00", pay_type: "hourly", active: true, version: 1, reason: "Повышение ставки", apply_to_future: true };
+  it("automatically applies profile rate changes to worked shifts and rejects zero rates through both editors", async () => {
+    const id = await shift(ids[1], { date: new Date(Date.parse(day) - 86400000).toISOString().slice(0, 10) });
+    const body = { name: "Анна", phone: "+375290000001", rate: "21.00", pay_type: "hourly", active: true, version: 1, reason: "Повышение ставки" };
     expect((await call(admin, "PATCH", `/employees/${ids[1]}`, { ...body, rate: "0" })).json().code).toBe("INVALID_RATE");
     expect((await call(admin, "PATCH", `/employees/${ids[1]}/hourly-rate`, { rate: "0.00", version: 1, reason: "Проверка ставки" })).json().code).toBe("INVALID_RATE");
     expect((await call(admin, "PATCH", `/employees/${ids[1]}`, body)).statusCode).toBe(200);
@@ -1064,10 +1064,13 @@ describe("Individual hourly rates", () => {
     expect((await call(a, "GET", `/shifts/${id}`)).json().amount).toBe("28.00");
     expect((await call(admin, "POST", "/shift-types", { name: "Фиксированная", start_time: "08:00", end_time: "10:00", pay_type: "shift" })).json().code).toBe("FIXED_RATE_REQUIRED");
   });
-  it("updates future hourly shifts but preserves past, fixed and manually overridden rates", async () => {
+  it("reprices all past, ongoing, future, fixed and manually overridden shifts", async () => {
     const offset = (n: number) =>
       new Date(Date.parse(day) + n * 86400000).toISOString().slice(0, 10);
     const past = await shift(ids[1], { date: offset(-1) });
+    const worked = await shift(ids[1], { date: offset(-2), status: "worked" });
+    const closed = await shift(ids[1], { date: offset(-3), status: "closed" });
+    const ongoing = await shift(ids[1], { start_time: "08:00", end_time: "12:00" });
     const future = await shift(),
       listing = await list(future);
     const manual = await shift(ids[1], {
@@ -1080,21 +1083,36 @@ describe("Individual hourly rates", () => {
       [fixedType],
     );
     const fixed = await shift(ids[1], { date: offset(2), type_id: fixedType });
+    // Simulate a fixed payment saved before employee rates took precedence.
+    await db.query("UPDATE shifts SET rate=80,pay_type='shift' WHERE id=$1", [fixed]);
+    const cancelled = await shift(ids[1], { date: offset(3), status: "cancelled" });
+    const foreign = await shift(ids[2]);
     const r = await call(admin, "PATCH", `/employees/${ids[1]}/hourly-rate`, {
       rate: "22.50",
       version: 1,
-      apply_to_future: true,
       reason: "Повышение квалификации",
     });
     expect(r.statusCode, r.body).toBe(200);
-    expect(r.json().updated_shifts).toBe(1);
+    expect(r.json().updated_shifts).toBe(7);
     for (const [id, rate] of [
-      [past, "14.00"],
+      [past, "22.50"],
+      [worked, "22.50"],
+      [closed, "22.50"],
+      [ongoing, "22.50"],
       [future, "22.50"],
-      [manual, "27.00"],
-      [fixed, "80.00"],
+      [manual, "22.50"],
+      [fixed, "22.50"],
+      [cancelled, "14.00"],
     ])
       expect((await call(a, "GET", `/shifts/${id}`)).json().rate).toBe(rate);
+    expect((await call(b, "GET", `/shifts/${foreign}`)).json().rate).toBe("16.00");
+    expect((await db.query("SELECT rate_override FROM shifts WHERE id=$1", [manual]))[0].rate_override).toBe(false);
+    const payroll = (await call(a, "GET", `/me/payroll?from=${offset(-3)}&to=${offset(3)}`)).json();
+    for (const row of payroll) {
+      expect(Number(row.amount)).toBe(row.minutes / 60 * 22.5);
+      expect(Number(row.planned_amount)).toBe(row.planned_minutes / 60 * 22.5);
+    }
+    expect(payroll.filter((row: any) => row.minutes > 0)).toHaveLength(3);
     expect(
       (
         await db.query("SELECT status FROM exchange_listings WHERE id=$1", [
@@ -1102,7 +1120,7 @@ describe("Individual hourly rates", () => {
         ])
       )[0].status,
     ).toBe("closed");
-    const created = await shift(ids[1], { date: offset(3) });
+    const created = await shift(ids[1], { date: offset(3), type_id: fixedType });
     expect((await call(a, "GET", `/shifts/${created}`)).json().amount).toBe(
       "45.00",
     );
@@ -1114,7 +1132,7 @@ describe("Individual hourly rates", () => {
       )[0].reason,
     ).toBe("Повышение квалификации");
   });
-  it("can apply only to new shifts and denies barista changes, negative values and stale versions", async () => {
+  it("ignores the retired opt-out and denies barista changes, negative values and stale versions", async () => {
     const id = await shift(),
       body = {
         rate: "19.75",
@@ -1138,7 +1156,7 @@ describe("Individual hourly rates", () => {
       (await call(admin, "PATCH", `/employees/${ids[1]}/hourly-rate`, body))
         .statusCode,
     ).toBe(200);
-    expect((await call(a, "GET", `/shifts/${id}`)).json().rate).toBe("14.00");
+    expect((await call(a, "GET", `/shifts/${id}`)).json().rate).toBe("19.75");
     expect(
       (await call(admin, "PATCH", `/employees/${ids[1]}/hourly-rate`, body))
         .statusCode,
@@ -1150,6 +1168,37 @@ describe("Individual hourly rates", () => {
     expect((await call(a, "GET", `/shifts/${fresh}`)).json().rate).toBe(
       "19.75",
     );
+  });
+  it.each(["profile", "hourly"])("recalculates earned salary and corrected hours on raises and cuts through the %s editor", async (editor) => {
+    const date = new Date(Date.parse(day) - 40 * 86400000).toISOString().slice(0, 10);
+    const id = await shift(ids[1], { date, status: "closed" });
+    expect((await call(admin, "POST", `/shifts/${id}/adjustments`, { minutes: 30, amount: "5.00", reason: "Дополнительные часы и премия" })).statusCode).toBe(200);
+    for (const [version, rate, expected] of [[1, "22.50", "61.25"], [2, "10.00", "30.00"]] as const) {
+      const body = { rate, version, reason: "Пересчёт всей зарплаты", ...(editor === "profile" ? { name: "Анна", phone: "+375290000001", pay_type: "hourly", active: true, apply_to_future: false } : {}) };
+      const result = await call(admin, "PATCH", `/employees/${ids[1]}${editor === "hourly" ? "/hourly-rate" : ""}`, body);
+      expect(result.statusCode, result.body).toBe(200);
+      expect((await call(a, "GET", `/shifts/${id}`)).json()).toMatchObject({ rate, amount: expected, adjustment_minutes: 30, adjustment_amount: "5.00" });
+      const personal = (await call(a, "GET", `/me/payroll?from=${date}&to=${date}`)).json();
+      expect(personal).toEqual([expect.objectContaining({ minutes: 150, amount: expected, planned_amount: "0" })]);
+      expect((await call(admin, "GET", `/payroll?from=${date}&to=${date}&user_id=${ids[1]}`)).json()).toEqual(personal);
+    }
+  });
+  it("reprices legacy personal minutes without changing another employee's shift or cash bonus", async () => {
+    const id = await shift(ids[2]), correction = uid();
+    await db.query("INSERT INTO adjustments(id,shift_id,user_id,minutes,amount,credit_amount,reason,created_by) VALUES($1,$2,$3,30,5,12,'Старые часы и премия',$4)", [correction, id, ids[1], ids[0]]);
+    const result = await call(admin, "PATCH", `/employees/${ids[1]}/hourly-rate`, { rate: "22.50", version: 1, reason: "Пересчёт личных часов" });
+    expect(result.statusCode, result.body).toBe(200);
+    expect((await call(a, "GET", `/me/payroll?from=${day}&to=${day}`)).json()[0]).toMatchObject({ planned_minutes: 30, planned_amount: "16.25" });
+    expect((await call(b, "GET", `/shifts/${id}`)).json()).toMatchObject({ rate: "16.00", amount: "32.00", version: 1 });
+    expect((await db.query("SELECT amount::text,credit_amount::text FROM adjustments WHERE id=$1", [correction]))[0]).toEqual({ amount: "5.00", credit_amount: "16.25" });
+  });
+  it("recalculates all existing shifts when switching the employee payment model", async () => {
+    const date = new Date(Date.parse(day) - 86400000).toISOString().slice(0, 10);
+    const id = await shift(ids[1], { date, status: "worked" });
+    const result = await call(admin, "PATCH", `/employees/${ids[1]}`, { name: "Анна", phone: "+375290000001", rate: "90.00", pay_type: "shift", active: true, version: 1, reason: "Оплата за смену" });
+    expect(result.statusCode, result.body).toBe(200);
+    expect((await call(a, "GET", `/shifts/${id}`)).json()).toMatchObject({ rate: "90.00", pay_type: "shift", amount: "90.00" });
+    expect((await call(a, "GET", `/me/payroll?from=${date}&to=${date}`)).json()[0].amount).toBe("90.00");
   });
 });
 

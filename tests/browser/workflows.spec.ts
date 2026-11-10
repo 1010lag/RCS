@@ -201,7 +201,8 @@ test("admin changes a barista hourly rate from their team card", async ({
   await card.getByRole("button", { name: "Изменить ставку в час" }).click();
   const dialog = page.getByRole("dialog");
   await dialog.getByLabel("Ставка в час, Br", { exact: true }).fill("17.50");
-  await dialog.getByLabel("Пересчитать будущие смены по ставке сотрудника").uncheck();
+  await expect(dialog.locator('input[name="apply_to_future"]')).toHaveCount(0);
+  await expect(dialog).toContainText("Вся зарплата автоматически пересчитается по новой ставке");
   await dialog
     .getByLabel("Причина изменения", { exact: true })
     .fill("Повышение почасовой ставки");

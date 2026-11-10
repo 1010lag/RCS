@@ -533,7 +533,6 @@ export async function createApp(
             pay_type: z.enum(["hourly", "shift"]),
             active: z.boolean(),
             version: z.number().int(),
-            apply_to_future: z.boolean().default(false),
             reason: z.string().trim().min(3),
             password: passwordSchema.optional(),
             current_password: z.string().max(128).optional(),
@@ -616,9 +615,9 @@ export async function createApp(
           )
         )[0];
         if (String(old.rate) !== String(u.rate) || old.pay_type !== u.pay_type) {
-          if (b.apply_to_future && u.rate !== null) await updateFutureRates(sql, req.user.id, id, u.rate, u.pay_type, b.reason);
+          if (u.rate !== null) await updateEmployeeRates(sql, req.user.id, id, u.rate, u.pay_type, b.reason);
           await notify(sql, [id].filter((recipient) => recipient !== req.user.id), "Ваша ставка изменена",
-            b.apply_to_future ? "Новая ставка применяется к новым сменам. Будущие смены по ставке сотрудника пересчитаны; ручные ставки сохранены." : "Новая ставка будет применяться к новым сменам. Существующие назначения сохраняют прежнюю оплату.", "adjustments", "payroll");
+            u.rate !== null ? "Все смены и начисления, включая уже отработанные часы, пересчитаны по новой ставке сотрудника." : "Индивидуальная ставка убрана. Для новых смен применяются настройки типа смены.", "adjustments", "payroll");
         }
         await audit(
           sql,
@@ -637,13 +636,33 @@ export async function createApp(
     },
     true,
   );
-  async function updateFutureRates(sql: Sql, actor: string, userId: string, rate: string, payType: string, reason: string) {
-    const shifts = await sql.query("SELECT s.id,s.rate::text,s.pay_type FROM shifts s JOIN shift_types t ON t.id=s.type_id WHERE s.user_id=$1 AND s.start_at>$2 AND s.status IN ('planned','confirmed') AND t.pay_type='hourly' AND NOT s.rate_override FOR UPDATE OF s", [userId, await time(sql)]);
+  async function updateEmployeeRates(sql: Sql, actor: string, userId: string, rate: string, payType: string, reason: string) {
+    const shifts = await sql.query("SELECT id,rate::text,pay_type,rate_override FROM shifts WHERE user_id=$1 AND status<>'cancelled' ORDER BY id FOR UPDATE", [userId]);
     for (const shift of shifts) {
-      await sql.query("UPDATE shifts SET rate=$1,pay_type=$2,version=version+1,updated_at=clock_timestamp() WHERE id=$3", [rate, payType, shift.id]);
+      await sql.query("UPDATE shifts SET rate=$1,pay_type=$2,rate_override=false,version=version+1,updated_at=clock_timestamp() WHERE id=$3", [rate, payType, shift.id]);
       await closeListing(sql, shift.id);
-      await audit(sql, actor, "Ставка будущей смены обновлена", "shift", shift.id, { rate: shift.rate, pay_type: shift.pay_type }, { rate, pay_type: payType }, reason);
+      await audit(sql, actor, "Ставка смены пересчитана", "shift", shift.id, { rate: shift.rate, pay_type: shift.pay_type, rate_override: shift.rate_override }, { rate, pay_type: payType, rate_override: false }, reason);
     }
+    // Personal corrections stay with their beneficiary, even in legacy shifts
+    // transferred to another employee. Reprice minutes, preserving cash bonuses.
+    const adjustments = await sql.query(
+      `WITH source AS (
+        SELECT a.id,a.credit_amount AS old_credit_amount,a.amount,a.minutes,
+        EXTRACT(EPOCH FROM(s.end_at-s.start_at))/60 AS base_minutes,
+        sum(a.minutes) OVER(PARTITION BY a.shift_id ORDER BY a.created_at,a.id) AS running_minutes
+        FROM adjustments a JOIN shifts s ON s.id=a.shift_id WHERE a.user_id=$1 AND s.status<>'cancelled'
+      ), repriced AS (
+        SELECT *,CASE WHEN $3='shift' THEN amount ELSE
+        round((base_minutes+running_minutes)*$2::numeric/60,2)-round((base_minutes+running_minutes-minutes)*$2::numeric/60,2)+amount END AS credit_amount
+        FROM source
+      ) UPDATE adjustments a SET credit_amount=r.credit_amount FROM repriced r
+      WHERE a.id=r.id AND a.credit_amount IS DISTINCT FROM r.credit_amount
+      RETURNING a.id,r.old_credit_amount::text,a.credit_amount::text`,
+      [userId, rate, payType],
+    );
+    for (const adjustment of adjustments)
+      await audit(sql, actor, "Корректировка пересчитана по ставке сотрудника", "adjustment", adjustment.id,
+        { credit_amount: adjustment.old_credit_amount }, { credit_amount: adjustment.credit_amount }, reason);
     return shifts.length;
   }
   route(
@@ -656,7 +675,6 @@ export async function createApp(
           .object({
             rate: z.string(),
             version: z.number().int(),
-            apply_to_future: z.boolean().default(false),
             reason: z.string().trim().min(3).max(1000),
           })
           .parse(req.body);
@@ -670,7 +688,7 @@ export async function createApp(
           "UPDATE users SET rate=$1,pay_type='hourly',version=version+1 WHERE id=$2",
           [rate, id],
         );
-        const changed = body.apply_to_future ? await updateFutureRates(sql, req.user.id, id, rate, "hourly", body.reason) : 0;
+        const changed = await updateEmployeeRates(sql, req.user.id, id, rate, "hourly", body.reason);
         await audit(
           sql,
           req.user.id,
@@ -685,9 +703,7 @@ export async function createApp(
           sql,
           [id].filter((recipient) => recipient !== req.user.id),
           "Ваша почасовая ставка изменена",
-          body.apply_to_future
-            ? `Обновлена ставка и расчёт будущих смен по ставке сотрудника (${changed}). Подробности — в ваших начислениях.`
-            : "Новая ставка будет применяться при создании новых почасовых смен.",
+          `Все смены (${changed}) и начисления, включая уже отработанные часы, пересчитаны по новой почасовой ставке. Подробности — в ваших начислениях.`,
           "adjustments",
           "payroll",
         );

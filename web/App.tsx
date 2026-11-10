@@ -2323,10 +2323,9 @@ function ModalDialog({
               api(`/employees/${employee.id}/hourly-rate`, "PATCH", {
                 rate: b.rate,
                 version: employee.version,
-                apply_to_future: b.apply_to_future === "on",
                 reason: b.reason,
               }),
-            "Почасовая ставка обновлена",
+            "Почасовая ставка обновлена, вся зарплата пересчитана",
           )
         }
       >
@@ -2355,15 +2354,10 @@ function ModalDialog({
             autoFocus
           />
         </Field>
-        <label className="checkbox-field">
-          <input type="checkbox" name="apply_to_future" defaultChecked />
-          Пересчитать будущие смены по ставке сотрудника
-        </label>
         <p className="muted small">
-          Применяется к новым сменам. При выбранном пересчёте обновятся также
-          ещё не начавшиеся смены по ставке сотрудника; их открытые объявления будут
-          закрыты. Прошедшие смены, фиксированные типы и ставки, заданные
-          вручную в смене, сохраняются.
+          Вся зарплата автоматически пересчитается по новой ставке, включая
+          уже отработанные часы и будущие смены. Ставка сотрудника заменит
+          прежние ставки во всех его сменах. Открытые объявления закроются.
         </p>
         <Field label="Причина изменения">
           <input
@@ -2400,7 +2394,6 @@ function ModalDialog({
                   phone: b.phone,
                   rate: b.rate || null,
                   pay_type: b.pay_type,
-                  ...(e ? { apply_to_future: b.apply_to_future === "on" } : {}),
                   ...(e
                     ? {
                         active: b.active === "on",
@@ -2474,8 +2467,7 @@ function ModalDialog({
         </div>
         {e && (
           <>
-            <label className="checkbox-field"><input type="checkbox" name="apply_to_future" defaultChecked />Пересчитать будущие смены по ставке сотрудника</label>
-            <p className="muted small">При изменении ставки или модели оплаты пересчитываются будущие смены по ставке сотрудника. Прошлые смены, фиксированные типы и ручные ставки сохраняются.</p>
+            <p className="muted small">При изменении ставки или модели оплаты вся зарплата автоматически пересчитывается, включая уже отработанные часы и будущие смены. Новая ставка заменяет прежние ставки во всех сменах сотрудника.</p>
             <label className="checkbox-field">
               <input type="checkbox" name="active" defaultChecked={e.active} />
               Сотрудник активен
